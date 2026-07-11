@@ -571,7 +571,8 @@ def _print_live_preflight(payload: dict[str, object], *, json_output: bool) -> N
                 ("Pregame cutoff uses", payload["effective_start_time"]),
                 ("Start offset", f"{payload['start_time_delta_seconds']} seconds"),
                 ("Exchange expiration", payload["order_expiration_time"]),
-                ("Maximum loss", money(payload["estimated_order_cost"])),
+                ("Estimated maker fee", money(payload["estimated_maker_fee"])),
+                ("Maximum loss", money(payload["maximum_loss"])),
             ),
         )
     )

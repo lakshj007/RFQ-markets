@@ -155,6 +155,9 @@ class KalshiClient:
             params["tags"] = tags
         return self._request("GET", "/series", params=params).get("series", [])
 
+    def get_series_details(self, series_ticker: str) -> dict[str, Any]:
+        return self._request("GET", f"/series/{series_ticker}")["series"]
+
     def get_events(
         self,
         *,

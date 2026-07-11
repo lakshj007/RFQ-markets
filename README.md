@@ -224,7 +224,9 @@ For sportsbook-backed fair values, the matched sportsbook event start is carried
 the live request as an independent start time. The pregame gate uses whichever is
 earlier: that independent start or Kalshi's occurrence timestamp. The preview prints
 both timestamps and their offset, so a late Kalshi timestamp cannot accidentally keep
-the order path enabled after the actual game begins.
+the order path enabled after the actual game begins. The preview also reads the series
+fee model and includes any applicable maker fee in its maximum-loss figure; unknown fee
+models fail closed.
 
 After reviewing the preview, submit the exact same order with all real-money gates.
 Use a unique intent ID and reuse that ID if a command must be retried; the client will

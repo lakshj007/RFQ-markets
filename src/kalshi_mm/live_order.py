@@ -7,7 +7,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_CEILING, Decimal
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -23,10 +23,13 @@ HARD_MAX_SPREAD = Decimal("0.15")
 HARD_MAX_QUEUE_AHEAD = Decimal("500")
 HARD_MAX_TRADE_AGE_SECONDS = 900
 HARD_MAX_EXPIRATION_SECONDS = 300
+MAKER_FEE_RATE = Decimal("0.0175")
 INTENT_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{7,39}$")
 
 
 class LiveOrderClient(Protocol):
+    def get_series_details(self, series_ticker: str) -> dict[str, Any]: ...
+
     def get_market(self, ticker: str) -> dict[str, Any]: ...
 
     def get_orderbook(self, ticker: str, *, depth: int = 20) -> dict[str, Any]: ...
@@ -192,6 +195,8 @@ class LivePreflight:
     recent_contracts: Decimal
     queue_ahead: Decimal
     estimated_order_cost: Decimal
+    estimated_maker_fee: Decimal
+    maximum_loss: Decimal
     position: Decimal | None
     available_balance: Decimal | None
 
@@ -216,6 +221,8 @@ class LivePreflight:
             "recent_contracts": str(self.recent_contracts),
             "queue_ahead": str(self.queue_ahead),
             "estimated_order_cost": str(self.estimated_order_cost),
+            "estimated_maker_fee": str(self.estimated_maker_fee),
+            "maximum_loss": str(self.maximum_loss),
             "position": str(self.position) if self.position is not None else None,
             "available_balance": (
                 str(self.available_balance) if self.available_balance is not None else None
@@ -260,6 +267,34 @@ def _recent_activity(
     return max(item[0] for item in recent), sum((item[1] for item in recent), ZERO)
 
 
+def _maximum_maker_fee(
+    market: dict[str, Any],
+    series: dict[str, Any],
+    request: LiveOrderRequest,
+    *,
+    order_expiration: datetime,
+) -> Decimal:
+    waiver_expiration = _parse_time(market.get("fee_waiver_expiration_time"))
+    if waiver_expiration is not None and waiver_expiration >= order_expiration:
+        return ZERO
+    fee_type = str(series.get("fee_type", ""))
+    if fee_type == "quadratic":
+        return ZERO
+    if fee_type != "quadratic_with_maker_fees":
+        raise ValueError(f"unsupported or unknown live maker fee type: {fee_type or 'missing'}")
+    multiplier = as_decimal(series.get("fee_multiplier", "0"))
+    if not ZERO < multiplier <= ONE:
+        raise ValueError("live maker fee multiplier must be in (0, 1]")
+    raw_fee = (
+        MAKER_FEE_RATE
+        * multiplier
+        * request.count
+        * request.price
+        * (ONE - request.price)
+    )
+    return raw_fee.quantize(Decimal("0.01"), rounding=ROUND_CEILING)
+
+
 def preflight_live_order(
     client: LiveOrderClient,
     request: LiveOrderRequest,
@@ -286,6 +321,16 @@ def preflight_live_order(
     effective_start = min(market_occurrence, external_start)
     if effective_start <= now + timedelta(minutes=5):
         raise ValueError("live testing is pregame-only and stops five minutes before start")
+    order_expiration = now + timedelta(seconds=request.expiration_seconds)
+    event_ticker = str(market.get("event_ticker", request.ticker))
+    series_ticker = event_ticker.split("-", 1)[0]
+    series = client.get_series_details(series_ticker)
+    estimated_maker_fee = _maximum_maker_fee(
+        market,
+        series,
+        request,
+        order_expiration=order_expiration,
+    )
 
     grid = PriceGrid.from_market(market)
     if grid.floor(request.price) != request.price or grid.ceil(request.price) != request.price:
@@ -326,8 +371,9 @@ def preflight_live_order(
         raise ValueError("recent public trade volume is below the live minimum")
 
     estimated_cost = request.price * request.count if request.side == "bid" else ZERO
-    if estimated_cost > limits.max_order_cost:
-        raise ValueError("estimated order cost exceeds the live cost limit")
+    maximum_loss = estimated_cost + estimated_maker_fee
+    if maximum_loss > limits.max_order_cost:
+        raise ValueError("maximum order loss including maker fees exceeds the live cost limit")
 
     position: Decimal | None = None
     balance: Decimal | None = None
@@ -341,8 +387,8 @@ def preflight_live_order(
         if request.side == "bid":
             if abs(position + request.count) > limits.max_abs_position:
                 raise ValueError("projected position exceeds the live position limit")
-            if balance < estimated_cost:
-                raise ValueError("available balance is below the estimated order cost")
+            if balance < maximum_loss:
+                raise ValueError("available balance is below the maximum order loss")
         else:
             if position < request.count:
                 raise ValueError("live asks are reduce-only and require an existing YES position")
@@ -362,11 +408,13 @@ def preflight_live_order(
         external_start_time=external_start,
         effective_start_time=effective_start,
         start_time_delta_seconds=int((market_occurrence - external_start).total_seconds()),
-        order_expiration_time=now + timedelta(seconds=request.expiration_seconds),
+        order_expiration_time=order_expiration,
         latest_trade_time=latest_trade,
         recent_contracts=recent_contracts,
         queue_ahead=queue_ahead,
         estimated_order_cost=estimated_cost,
+        estimated_maker_fee=estimated_maker_fee,
+        maximum_loss=maximum_loss,
         position=position,
         available_balance=balance,
     )

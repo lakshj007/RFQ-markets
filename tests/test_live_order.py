@@ -27,11 +27,16 @@ class FakeLiveClient:
     def get_market(self, ticker: str) -> dict:
         return {
             "ticker": ticker,
+            "event_ticker": "SERIES-EVENT",
             "title": "Seattle vs Portland Winner?",
             "status": "active",
             "occurrence_datetime": (self.now + self.market_start_offset).isoformat(),
             "price_ranges": [{"start": "0", "end": "1", "step": "0.01"}],
         }
+
+    def get_series_details(self, series_ticker: str) -> dict:
+        assert series_ticker == "SERIES"
+        return {"ticker": series_ticker, "fee_type": "quadratic", "fee_multiplier": 1}
 
     def get_orderbook(self, ticker: str, *, depth: int = 20) -> dict:
         assert depth == 1
@@ -130,6 +135,8 @@ def test_public_preflight_requires_recent_flow_and_edge() -> None:
     assert result.external_start_time == now + timedelta(hours=1)
     assert result.effective_start_time == now + timedelta(hours=1)
     assert result.order_expiration_time == now + timedelta(seconds=120)
+    assert result.estimated_maker_fee == Decimal("0")
+    assert result.maximum_loss == Decimal("0.16")
     assert result.position is None
     assert result.available_balance is None
 
@@ -267,6 +274,30 @@ def test_preflight_reports_three_hour_market_start_offset() -> None:
 
     assert result.effective_start_time == now + timedelta(hours=1)
     assert result.start_time_delta_seconds == 3 * 60 * 60
+
+
+def test_preflight_includes_maker_fee_in_maximum_loss() -> None:
+    now = datetime(2026, 7, 11, 2, tzinfo=UTC)
+
+    class MakerFeeClient(FakeLiveClient):
+        def get_series_details(self, series_ticker: str) -> dict:
+            return {
+                "ticker": series_ticker,
+                "fee_type": "quadratic_with_maker_fees",
+                "fee_multiplier": 1,
+            }
+
+    result = preflight_live_order(
+        MakerFeeClient(now),
+        request(),
+        LiveRiskLimits(),
+        authenticated=False,
+        now=now,
+    )
+
+    assert result.estimated_order_cost == Decimal("0.16")
+    assert result.estimated_maker_fee == Decimal("0.01")
+    assert result.maximum_loss == Decimal("0.17")
 
 
 def test_execute_requires_environment_kill_switch(monkeypatch, tmp_path) -> None:
