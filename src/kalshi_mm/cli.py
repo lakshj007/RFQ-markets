@@ -34,7 +34,7 @@ from .maker_paper import MakerPaperRecorder, MakerPaperUpdate
 from .models import Level, OrderBook, PriceGrid, as_decimal
 from .odds import DEFAULT_SHARP_BOOKMAKERS, OddsClient
 from .paper import PaperRecorder
-from .scanner import Discrepancy, scan_moneyline_discrepancies
+from .scanner import Discrepancy, scan_discrepancies
 from .strategy import MarketMakerStrategy, StrategyConfig, devig_two_way
 from .ws import KalshiWebSocket, StreamUpdate
 
@@ -301,21 +301,27 @@ def _discrepancy_dict(item: Discrepancy) -> dict[str, object]:
         "fair_probability": str(item.fair_probability),
         "yes_bid": str(item.yes_bid),
         "yes_ask": str(item.yes_ask),
+        "yes_bid_size": str(item.yes_bid_size),
+        "yes_ask_size": str(item.yes_ask_size),
         "midpoint": str(item.midpoint),
         "action": item.action,
         "edge": str(item.edge),
         "bookmaker_count": item.bookmaker_count,
         "match_score": item.match_score,
+        "market_type": item.market_type,
+        "line": str(item.line) if item.line is not None else None,
+        "spread": str(item.yes_ask - item.yes_bid),
     }
 
 
 def _scan(args: argparse.Namespace) -> tuple[list[Discrepancy], OddsClient]:
     odds = OddsClient.from_env()
-    results = scan_moneyline_discrepancies(
+    results = scan_discrepancies(
         kalshi=_client(),
         odds=odds,
         series_ticker=args.series,
         sport=args.sport,
+        market_type=args.market_type,
         regions=args.regions,
         bookmakers=args.bookmakers,
         min_edge=args.min_edge_cents / Decimal("100"),
@@ -332,6 +338,7 @@ def _print_scan(
     results: list[Discrepancy],
     odds: OddsClient,
     *,
+    market_type: str,
     show_all: bool,
     json_output: bool,
 ) -> None:
@@ -342,7 +349,7 @@ def _print_scan(
         return
     quota = odds.quota
     print(
-        "Odds/Kalshi moneyline scan "
+        f"Odds/Kalshi {market_type} scan "
         f"(opportunities {sum(item.action != 'NONE' for item in results)}, "
         f"matched markets {len(results)})"
     )
@@ -355,7 +362,17 @@ def _print_scan(
         print()
     print(
         table(
-            ("TICKER", "OUTCOME", "FAIR", "BID", "ASK", "ACTION", "EDGE", "BOOKS"),
+            (
+                "TICKER",
+                "OUTCOME",
+                "FAIR",
+                "BID",
+                "ASK",
+                "SPREAD",
+                "ACTION",
+                "EDGE",
+                "BOOKS",
+            ),
             (
                 (
                     item.ticker,
@@ -363,20 +380,27 @@ def _print_scan(
                     f"{item.fair_probability * 100:.2f}%",
                     money(item.yes_bid),
                     money(item.yes_ask),
+                    f"{(item.yes_ask - item.yes_bid) * 100:.2f}c",
                     item.action,
                     f"{item.edge * 100:+.2f}c",
                     item.bookmaker_count,
                 )
                 for item in visible
             ),
-            right_align={2, 3, 4, 6, 7},
+            right_align={2, 3, 4, 5, 7, 8},
         )
     )
 
 
 def _cmd_scan(args: argparse.Namespace) -> None:
     results, odds = _scan(args)
-    _print_scan(results, odds, show_all=args.show_all, json_output=args.json)
+    _print_scan(
+        results,
+        odds,
+        market_type=args.market_type,
+        show_all=args.show_all,
+        json_output=args.json,
+    )
 
 
 def _parse_horizons(value: str) -> tuple[int, ...]:
@@ -399,7 +423,13 @@ def _cmd_paper(args: argparse.Namespace) -> None:
     while args.iterations == 0 or completed < args.iterations:
         results, odds = _scan(args)
         update = recorder.update(results)
-        _print_scan(results, odds, show_all=args.show_all, json_output=args.json)
+        _print_scan(
+            results,
+            odds,
+            market_type=args.market_type,
+            show_all=args.show_all,
+            json_output=args.json,
+        )
         if not args.json:
             print(
                 f"\nPaper log: {args.output} | new signals {update.signals_recorded} | "
@@ -763,6 +793,12 @@ def _cmd_stream(args: argparse.Namespace) -> None:
 def _add_scan_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--series", required=True, help="Kalshi series, e.g. KXMLBGAME")
     parser.add_argument("--sport", required=True, help="Odds API sport, e.g. baseball_mlb")
+    parser.add_argument(
+        "--market-type",
+        choices=("h2h", "totals"),
+        default="h2h",
+        help="compare game winners or exact full-game over/under lines",
+    )
     parser.add_argument("--regions", default="us")
     parser.add_argument(
         "--bookmakers",
@@ -870,7 +906,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     scan = subparsers.add_parser(
         "scan",
-        help="compare no-vig sportsbook moneylines with executable Kalshi prices",
+        help="compare no-vig sportsbook prices with exact Kalshi contracts",
     )
     _add_scan_arguments(scan)
     scan.set_defaults(func=_cmd_scan)

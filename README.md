@@ -287,14 +287,28 @@ kalshi-mm scan \
   --min-edge-cents 3
 ```
 
+Compare exact full-game total lines, such as an MLB over/under:
+
+```bash
+kalshi-mm scan \
+  --series KXMLBTOTAL \
+  --sport baseball_mlb \
+  --market-type totals \
+  --min-bookmakers 3 \
+  --min-edge-cents 3 \
+  --show-all
+```
+
 Add `--show-all` to inspect every safely matched market, including markets without an
 actionable edge. The scan displays remaining Odds API quota and the cost of the last
 request. It is pregame-only unless `--include-live` is provided. Scans use the same
 default sharp-book filter, overridable with `--bookmakers`.
 
-Current scope is intentionally narrow: same-game head-to-head/moneyline markets. It
-does not assume that a spread, total, prop, regulation-only result, or advancement
-market is equivalent to a game-winner contract.
+The scanner supports same-game head-to-head/moneyline markets and exact full-game
+totals. A totals comparison requires the same event and exact numerical line at each
+bookmaker; books quoting a different line are ignored. Team totals, first-half/period
+totals, player props, spreads, and advancement markets remain excluded rather than
+assuming their settlement rules are equivalent.
 
 ## Paper signals and markouts
 
