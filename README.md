@@ -1,6 +1,10 @@
 # Kalshi sports market-maker sample
 
-This repository is a dry-run-first reference implementation for exploring Kalshi sports markets and generating two-sided quotes. It is intentionally not a production trading system. The only execution mode exposed by the CLI is Kalshi's demo environment; production writes are not wired into the command line.
+This repository is a dry-run-first implementation for exploring Kalshi sports markets
+and generating two-sided quotes. Continuous execution remains restricted to Kalshi's
+demo environment. Production execution is limited to a separate, guarded, one-shot
+`live-order` command for a single pregame contract; automated production market making
+and in-play order entry are not enabled.
 
 The implementation targets the API shape documented in June 2026:
 
@@ -31,10 +35,21 @@ python3 -m pip install -e '.[dev]'
 pytest
 ```
 
-All market-data commands are public and require no credentials.
+REST discovery commands are public and require no Kalshi credentials.
 
 Commands print readable terminal tables by default. Add `--json` to any command when
 machine-readable output is needed for another script.
+
+Create a local `.env` for credentials. The file is ignored by Git:
+
+```text
+ODDS_API_KEY=your-odds-api-key
+KALSHI_API_KEY_ID=your-kalshi-key-id
+KALSHI_PRIVATE_KEY_PATH=/absolute/path/to/kalshi-private-key.key
+```
+
+The Odds API key is sufficient for discrepancy scans. Kalshi credentials are only
+required for WebSocket sessions and demo order execution.
 
 ## Explore sports markets
 
@@ -85,6 +100,26 @@ kalshi-mm run \
   --order-size 1 \
   --iterations 1
 ```
+
+Use a live, multi-book no-vig consensus directly as fair value:
+
+```bash
+kalshi-mm run \
+  --ticker KALSHI-MARKET-TICKER \
+  --odds-sport baseball_mlb \
+  --odds-regions us \
+  --odds-min-bookmakers 3 \
+  --odds-refresh 60 \
+  --edge-cents 2
+```
+
+The fair-value source caches its result between refreshes, so high-frequency Kalshi
+book updates do not consume an Odds API request each time. In-play external odds are
+rejected by default because the documented feed latency is materially slower during a
+live game. `--odds-include-live` is an explicit, higher-risk override. By default,
+Odds API fair values are restricted to the sharper-book set
+`pinnacle,circasports,bookmaker,fanduel`; the feed may return only the subset of
+those books available for a given sport.
 
 Dry-run from two sportsbook moneylines. The sample removes the two-way overround by normalizing the implied probabilities:
 
@@ -142,6 +177,201 @@ kalshi-mm run \
 
 The sample uses `post_only=true`, `cancel_order_on_pause=true`, `taker_at_cross` self-trade prevention, client-generated order IDs, and a maximum inventory cutoff. On normal exit or Ctrl-C it attempts to cancel every order it created during that process.
 
+## Guarded production order
+
+`live-order` means a real-money production order. It does not permit in-play trading,
+taker orders, continuous repricing, or automated two-sided production market making.
+The hard-coded ceiling is one contract, at most $1 of entry cost, and at most one
+contract of absolute position.
+
+Create a separate production API key with read/write scope, store the downloaded key
+outside the repository, and restrict its permissions:
+
+```bash
+chmod 600 /absolute/path/to/kalshi-production.key
+export KALSHI_PROD_API_KEY_ID='production-key-id'
+export KALSHI_PROD_PRIVATE_KEY_PATH='/absolute/path/to/kalshi-production.key'
+```
+
+First inspect the production account. This is authenticated but read-only:
+
+```bash
+kalshi-mm live-status --ticker MARKET-TICKER
+```
+
+Preview a one-contract post-only YES bid using a fresh sharp-book consensus. Preview
+does not require Kalshi credentials and never submits an order:
+
+```bash
+kalshi-mm live-order \
+  --ticker MARKET-TICKER \
+  --side bid \
+  --price-cents 16 \
+  --odds-sport soccer_usa_mls \
+  --expiration-seconds 120
+```
+
+The preview and execution both reject the order unless the market is active and at
+least five minutes pregame, the book is two-sided and no wider than 15 cents, the
+price is tick-valid and post-only, a public trade occurred within 15 minutes, recent
+volume is sufficient, the price joins or improves the current best level, no more than
+500 contracts are ahead at the same price, and a bid has at least two cents of modeled
+edge. Sharp-book prices must be no more than 60 seconds old. Execution also requires
+sufficient balance, no existing resting production orders, and compliance with the
+one-contract position limit.
+
+After reviewing the preview, submit the exact same order with all real-money gates.
+Use a unique intent ID and reuse that ID if a command must be retried; the client will
+reconcile an existing matching order instead of submitting a duplicate:
+
+```bash
+export KALSHI_LIVE_TRADING_ENABLED='I_UNDERSTAND_REAL_MONEY'
+
+kalshi-mm live-order \
+  --ticker MARKET-TICKER \
+  --side bid \
+  --price-cents 16 \
+  --odds-sport soccer_usa_mls \
+  --expiration-seconds 120 \
+  --wait-seconds 60 \
+  --execute-live \
+  --acknowledge-risk REAL_MONEY_ONE_CONTRACT \
+  --confirm-ticker MARKET-TICKER \
+  --intent-id 20260711-market-001
+
+unset KALSHI_LIVE_TRADING_ENABLED
+```
+
+Every submitted order is `post_only=true`, `cancel_order_on_pause=true`, uses
+`taker_at_cross` self-trade prevention, and carries an exchange-side expiration. The
+command polls the order and cancels any remainder after its local timeout. It also
+attempts cancellation on interruption or error and writes an append-only audit trail
+to `logs/live-orders.jsonl`. If submission returns an ambiguous network error, it
+reconciles by client order ID and cancels any recovered resting order.
+
+Manual fair values are supported only when accompanied by an ISO-8601 observation
+timestamp no more than 60 seconds old:
+
+```bash
+kalshi-mm live-order \
+  --ticker MARKET-TICKER \
+  --side bid \
+  --price-cents 16 \
+  --fair-probability 0.19 \
+  --fair-observed-at 2026-07-11T02:00:00Z
+```
+
+Asks are reduce-only and require an existing YES position. A risk-reducing exit may
+execute without the two-cent entry edge requirement. If a process crashes or an order
+needs manual recovery, inspect and cancel it explicitly:
+
+```bash
+kalshi-mm live-status
+
+kalshi-mm live-cancel \
+  --order-id ORDER-ID \
+  --confirm-order-id ORDER-ID \
+  --acknowledge-risk CANCEL_REAL_ORDER
+```
+
+## Scan sportsbook/Kalshi discrepancies
+
+Compare an Odds API moneyline consensus with executable Kalshi bids and asks:
+
+```bash
+kalshi-mm scan \
+  --series KXMLBGAME \
+  --sport baseball_mlb \
+  --regions us \
+  --min-bookmakers 3 \
+  --min-edge-cents 3
+```
+
+Add `--show-all` to inspect every safely matched market, including markets without an
+actionable edge. The scan displays remaining Odds API quota and the cost of the last
+request. It is pregame-only unless `--include-live` is provided. Scans use the same
+default sharp-book filter, overridable with `--bookmakers`.
+
+Current scope is intentionally narrow: same-game head-to-head/moneyline markets. It
+does not assume that a spread, total, prop, regulation-only result, or advancement
+market is equivalent to a game-winner contract.
+
+## Paper signals and markouts
+
+Record qualifying signals once per minute and measure their later midpoint movement:
+
+```bash
+kalshi-mm paper \
+  --series KXMLBGAME \
+  --sport baseball_mlb \
+  --min-edge-cents 3 \
+  --interval 60 \
+  --iterations 0 \
+  --markout-horizons 60,300 \
+  --output logs/mlb-paper.jsonl
+```
+
+The JSONL file contains append-only `signal` and `markout` records. This mode never
+submits orders. A signal is priced at the executable ask for BUY YES or executable bid
+for SELL YES, rather than at the midpoint. Run it continuously in one process to collect
+the configured future markouts.
+
+## Passive maker simulation
+
+Simulate one-contract quotes on both sides of high-spread markets and infer later fills
+from public Kalshi trades:
+
+```bash
+kalshi-mm maker-paper \
+  --series KXLIGAMXGAME \
+  --sport soccer_mexico_ligamx \
+  --min-spread-cents 4 \
+  --max-spread-cents 15 \
+  --min-edge-cents 1 \
+  --max-top-size 500 \
+  --quote-lifetime 600 \
+  --interval 60 \
+  --iterations 6 \
+  --state logs/ligamx-maker-state.json \
+  --output logs/ligamx-maker.jsonl
+```
+
+The simulator improves the current bid and ask by one tick only when the sharp-book
+fair value leaves the configured minimum edge on both sides. State survives process
+restarts. A simulated bid fill requires a later ask-side public trade at or below the
+quote; an ask fill requires a later bid-side trade at or above it. Quotes expire after
+the configured lifetime, and one-sided inventory is flattened at the then-executable
+bid or ask. Logged profit is before fees. This remains a model: public trades cannot
+prove queue position perfectly, so results must not be treated as actual fills.
+The maximum-spread guard excludes placeholder or broken books whose extreme width is
+not a credible market-making opportunity.
+
+## WebSocket market data
+
+Kalshi requires an authenticated handshake even for its market-data WebSocket. Watch
+a market without submitting orders:
+
+```bash
+kalshi-mm stream --ticker MARKET-TICKER --seconds 30
+```
+
+Use the sequence-checked WebSocket book in the dry-run market maker:
+
+```bash
+kalshi-mm run \
+  --ticker MARKET-TICKER \
+  --odds-sport baseball_mlb \
+  --websocket \
+  --interval 0.25 \
+  --iterations 20
+```
+
+The stream subscribes to orderbook snapshots/deltas, ticker updates, public trades,
+user orders, fills, and positions. It requests unified YES-price levels, checks every
+subscription sequence number, and reconnects with exponential backoff after a gap or
+disconnect. `--interval` becomes the minimum quote recalculation interval in WebSocket
+mode.
+
 ## API map
 
 | Purpose | Endpoint | Authentication |
@@ -172,7 +402,7 @@ The code supplies market-making mechanics, not alpha. Practical research directi
 
 Before any real-money deployment, add at least:
 
-- WebSocket orderbook, fill, position, and order streams with sequence-gap recovery
+- soak-tested WebSocket recovery, subscription acknowledgements, and burst handling
 - an order group or equivalent exchange-side kill switch
 - persistent order/fill state and startup reconciliation
 - stale-data clocks, feed disagreement checks, and event-status handling

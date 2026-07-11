@@ -11,6 +11,7 @@ requires-python = ">=3.11"
 dependencies = [
   "cryptography>=44",
   "requests>=2.32",
+  "websockets>=15",
 ]
 
 [project.optional-dependencies]
@@ -35,4 +36,3 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
-

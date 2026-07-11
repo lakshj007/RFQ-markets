@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Iterable, Sequence
 from decimal import Decimal
-from typing import Iterable, Sequence
 
 from .models import DesiredOrder, Level, OrderBook, QuotePlan, as_decimal
 

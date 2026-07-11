@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -12,7 +14,7 @@ from .display import quote_cycle
 from .fair_value import FairValueSource
 from .models import DesiredOrder, Level, OrderBook, QuotePlan, as_decimal
 from .strategy import MarketMakerStrategy, trade_imbalance
-
+from .ws import KalshiWebSocket
 
 LOGGER = logging.getLogger(__name__)
 
@@ -186,3 +188,87 @@ def run_bot(
     finally:
         if manager:
             manager.cancel_all()
+
+
+async def run_streaming_bot(
+    *,
+    client: KalshiClient,
+    ticker: str,
+    strategy: MarketMakerStrategy,
+    fair_value_source: FairValueSource,
+    dry_run_inventory: Decimal,
+    execute_demo: bool,
+    demo_data: bool,
+    minimum_quote_interval_seconds: float,
+    iterations: int,
+    trade_sample_size: int = 100,
+    json_output: bool = False,
+) -> None:
+    """Generate quotes from a sequence-checked WebSocket orderbook."""
+    stream = KalshiWebSocket(client, demo=demo_data or execute_demo)
+    manager = DemoOrderManager(client, ticker) if execute_demo else None
+    signed_trades: deque[tuple[Decimal, Decimal]] = deque(maxlen=trade_sample_size)
+    completed = 0
+    last_quote_time = 0.0
+    connection_number = 0
+    try:
+        async for update in stream.events([ticker]):
+            if update.connection_number != connection_number:
+                connection_number = update.connection_number
+                signed_trades.clear()
+                last_quote_time = 0.0
+            message_type = update.message.get("type")
+            if message_type == "trade":
+                payload = update.message.get("msg", {})
+                side = payload.get("taker_book_side")
+                count = as_decimal(payload.get("count_fp", "0"))
+                if side in {"bid", "ask"} and count > 0:
+                    signed_trades.append((count if side == "bid" else -count, count))
+                continue
+            if message_type not in {"orderbook_snapshot", "orderbook_delta"}:
+                continue
+            now = time.monotonic()
+            if now - last_quote_time < minimum_quote_interval_seconds:
+                continue
+            book = update.state.orderbook(ticker)
+            if book is None:
+                continue
+            signed_volume = sum((signed for signed, _ in signed_trades), Decimal("0"))
+            total_volume = sum((size for _, size in signed_trades), Decimal("0"))
+            recent_flow = signed_volume / total_volume if total_volume else Decimal("0")
+            inventory = (
+                as_decimal(await asyncio.to_thread(client.get_position, ticker))
+                if execute_demo
+                else dry_run_inventory
+            )
+            plan = strategy.quote(
+                book=book,
+                fair_probability=await asyncio.to_thread(fair_value_source.get, ticker),
+                inventory=inventory,
+                recent_trade_imbalance=recent_flow,
+            )
+            output = plan_as_dict(ticker=ticker, book=book, plan=plan, inventory=inventory)
+            if json_output:
+                print(json.dumps(output))
+            else:
+                if completed:
+                    print("\n" + "=" * 72 + "\n")
+                print(
+                    quote_cycle(
+                        cycle=completed + 1,
+                        ticker=ticker,
+                        book=book,
+                        plan=plan,
+                        inventory=inventory,
+                        execute_demo=execute_demo,
+                    )
+                )
+            if manager:
+                await asyncio.to_thread(manager.sync, plan)
+            completed += 1
+            last_quote_time = now
+            if iterations and completed >= iterations:
+                break
+    finally:
+        if manager:
+            await asyncio.to_thread(manager.cancel_all)

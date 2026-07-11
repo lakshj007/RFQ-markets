@@ -11,7 +11,6 @@ import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
-
 PRODUCTION_BASE_URL = "https://external-api.kalshi.com/trade-api/v2"
 DEMO_BASE_URL = "https://external-api.demo.kalshi.co/trade-api/v2"
 
@@ -70,6 +69,15 @@ class KalshiClient:
             private_key_path=os.getenv("KALSHI_PRIVATE_KEY_PATH"),
         )
 
+    @classmethod
+    def from_production_env(cls) -> KalshiClient:
+        """Use production-only variable names for any real-money workflow."""
+        return cls(
+            base_url=PRODUCTION_BASE_URL,
+            api_key_id=os.getenv("KALSHI_PROD_API_KEY_ID"),
+            private_key_path=os.getenv("KALSHI_PROD_PRIVATE_KEY_PATH"),
+        )
+
     @property
     def has_credentials(self) -> bool:
         return bool(self.api_key_id and self.private_key_path)
@@ -100,6 +108,10 @@ class KalshiClient:
                 self._load_private_key(), timestamp_ms, method, full_path
             ),
         }
+
+    def websocket_headers(self) -> dict[str, str]:
+        """Create authentication headers for the Trade API WebSocket handshake."""
+        return self._auth_headers("GET", "/trade-api/ws/v2")
 
     def _request(
         self,
@@ -165,6 +177,13 @@ class KalshiClient:
     def get_market(self, ticker: str) -> dict[str, Any]:
         return self._request("GET", f"/markets/{ticker}")["market"]
 
+    def get_event(self, event_ticker: str) -> dict[str, Any]:
+        return self._request(
+            "GET",
+            f"/events/{event_ticker}",
+            params={"with_nested_markets": "true"},
+        )["event"]
+
     def get_orderbook(self, ticker: str, *, depth: int = 20) -> dict[str, Any]:
         return self._request("GET", f"/markets/{ticker}/orderbook", params={"depth": depth})
 
@@ -173,23 +192,53 @@ class KalshiClient:
             "GET", "/markets/trades", params={"ticker": ticker, "limit": limit}
         ).get("trades", [])
 
-    def get_position(self, ticker: str) -> str:
+    def get_balance(self, *, subaccount: int = 0) -> dict[str, Any]:
+        return self._request(
+            "GET",
+            "/portfolio/balance",
+            params={"subaccount": subaccount},
+            authenticated=True,
+        )
+
+    def get_position(self, ticker: str, *, subaccount: int = 0) -> str:
         data = self._request(
             "GET",
             "/portfolio/positions",
-            params={"ticker": ticker, "count_filter": "position"},
+            params={
+                "ticker": ticker,
+                "count_filter": "position",
+                "subaccount": subaccount,
+            },
             authenticated=True,
         )
         positions = data.get("market_positions", [])
         return str(positions[0].get("position_fp", "0")) if positions else "0"
 
-    def get_resting_orders(self, ticker: str) -> list[dict[str, Any]]:
+    def get_orders(
+        self,
+        *,
+        ticker: str | None = None,
+        status: str | None = None,
+        subaccount: int = 0,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {
+            "subaccount": subaccount,
+            "limit": min(max(limit, 1), 1000),
+        }
+        if ticker:
+            params["ticker"] = ticker
+        if status:
+            params["status"] = status
         return self._request(
             "GET",
             "/portfolio/orders",
-            params={"ticker": ticker, "status": "resting", "limit": 100},
+            params=params,
             authenticated=True,
         ).get("orders", [])
+
+    def get_resting_orders(self, ticker: str, *, subaccount: int = 0) -> list[dict[str, Any]]:
+        return self.get_orders(ticker=ticker, status="resting", subaccount=subaccount)
 
     def create_order(
         self,
@@ -199,27 +248,39 @@ class KalshiClient:
         side: str,
         count: str,
         price: str,
+        expiration_time: int | None = None,
+        reduce_only: bool = False,
+        subaccount: int = 0,
+        post_only: bool = True,
+        cancel_order_on_pause: bool = True,
     ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "ticker": ticker,
+            "client_order_id": client_order_id,
+            "side": side,
+            "count": count,
+            "price": price,
+            "time_in_force": "good_till_canceled",
+            "self_trade_prevention_type": "taker_at_cross",
+            "post_only": post_only,
+            "cancel_order_on_pause": cancel_order_on_pause,
+            "reduce_only": reduce_only,
+            "subaccount": subaccount,
+            "exchange_index": 0,
+        }
+        if expiration_time is not None:
+            payload["expiration_time"] = expiration_time
         return self._request(
             "POST",
             "/portfolio/events/orders",
-            json={
-                "ticker": ticker,
-                "client_order_id": client_order_id,
-                "side": side,
-                "count": count,
-                "price": price,
-                "time_in_force": "good_till_canceled",
-                "self_trade_prevention_type": "taker_at_cross",
-                "post_only": True,
-                "cancel_order_on_pause": True,
-            },
+            json=payload,
             authenticated=True,
         )
 
-    def cancel_order(self, order_id: str) -> dict[str, Any]:
+    def cancel_order(self, order_id: str, *, subaccount: int = 0) -> dict[str, Any]:
         return self._request(
             "DELETE",
             f"/portfolio/events/orders/{order_id}",
+            params={"subaccount": subaccount, "exchange_index": 0},
             authenticated=True,
         )
