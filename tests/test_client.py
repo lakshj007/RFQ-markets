@@ -81,3 +81,27 @@ def test_create_order_uses_guarded_v2_payload(monkeypatch) -> None:
         "exchange_index": 0,
         "expiration_time": 123456,
     }
+
+
+def test_create_order_supports_reduce_only_ioc_exit(monkeypatch) -> None:
+    session = RecordingSession()
+    client = KalshiClient(session=session)  # type: ignore[arg-type]
+    monkeypatch.setattr(client, "_auth_headers", lambda method, path: {"auth": "test"})
+
+    client.create_order(
+        ticker="MARKET",
+        client_order_id="manual-exit-fallback-test-intent-001",
+        side="ask",
+        count="1",
+        price="0.55",
+        reduce_only=True,
+        post_only=False,
+        time_in_force="immediate_or_cancel",
+    )
+
+    payload = session.calls[0]["json"]
+    assert payload["side"] == "ask"
+    assert payload["reduce_only"] is True
+    assert payload["post_only"] is False
+    assert payload["time_in_force"] == "immediate_or_cancel"
+    assert "expiration_time" not in payload

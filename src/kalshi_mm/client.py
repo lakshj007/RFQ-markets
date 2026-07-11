@@ -256,6 +256,7 @@ class KalshiClient:
         subaccount: int = 0,
         post_only: bool = True,
         cancel_order_on_pause: bool = True,
+        time_in_force: str = "good_till_canceled",
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "ticker": ticker,
@@ -263,7 +264,7 @@ class KalshiClient:
             "side": side,
             "count": count,
             "price": price,
-            "time_in_force": "good_till_canceled",
+            "time_in_force": time_in_force,
             "self_trade_prevention_type": "taker_at_cross",
             "post_only": post_only,
             "cancel_order_on_pause": cancel_order_on_pause,
@@ -271,6 +272,8 @@ class KalshiClient:
             "subaccount": subaccount,
             "exchange_index": 0,
         }
+        if time_in_force == "immediate_or_cancel" and expiration_time is not None:
+            raise ValueError("immediate-or-cancel orders cannot have an expiration")
         if expiration_time is not None:
             payload["expiration_time"] = expiration_time
         return self._request(

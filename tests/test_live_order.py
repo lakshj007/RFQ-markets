@@ -6,10 +6,13 @@ import pytest
 
 from kalshi_mm.live_order import (
     LIVE_ENABLE_TOKEN,
+    BoundedExitRequest,
     LiveAuditLog,
     LiveOrderRequest,
     LiveRiskLimits,
+    execute_bounded_exit,
     execute_live_order,
+    preflight_bounded_exit,
     preflight_live_order,
 )
 
@@ -298,6 +301,111 @@ def test_preflight_includes_maker_fee_in_maximum_loss() -> None:
     assert result.estimated_order_cost == Decimal("0.16")
     assert result.estimated_maker_fee == Decimal("0.01")
     assert result.maximum_loss == Decimal("0.17")
+
+
+def exit_request() -> BoundedExitRequest:
+    return BoundedExitRequest(
+        ticker="MARKET",
+        target_price=Decimal("0.17"),
+        floor_price=Decimal("0.15"),
+        count=Decimal("1"),
+        external_start_time=datetime(2026, 7, 11, 3, tzinfo=UTC),
+        target_wait_seconds=5,
+    )
+
+
+def test_bounded_exit_preflight_estimates_ioc_fallback() -> None:
+    now = datetime(2026, 7, 11, 2, tzinfo=UTC)
+    client = FakeLiveClient(now)
+    client.position = "1"
+
+    result = preflight_bounded_exit(client, exit_request(), now=now)
+
+    assert result.fallback_price == Decimal("0.16")
+    assert result.estimated_fallback_fee == Decimal("0.01")
+    assert result.position == Decimal("1")
+
+
+class FakeBoundedExitClient(FakeLiveClient):
+    def __init__(self, now: datetime, *, fallback_bid: str = "0.16") -> None:
+        super().__init__(now)
+        self.position = "1"
+        self.fallback_bid = fallback_bid
+        self.target_cancelled = False
+
+    def get_orderbook(self, ticker: str, *, depth: int = 20) -> dict:
+        return {
+            "orderbook_fp": {
+                "yes_dollars": [[self.fallback_bid, "10"]],
+                "no_dollars": [["0.83", "10"]],
+            }
+        }
+
+    def get_orders(self, **kwargs) -> list[dict]:
+        if not self.created or self.target_cancelled:
+            return []
+        return [{"order_id": "order-1", "status": "resting"}]
+
+    def create_order(self, **kwargs) -> dict:
+        self.created.append(kwargs)
+        if kwargs["time_in_force"] == "immediate_or_cancel":
+            self.position = "0"
+            return {"order_id": "order-2", "fill_count": "1", "remaining_count": "0"}
+        return {"order_id": "order-1", "fill_count": "0", "remaining_count": "1"}
+
+    def cancel_order(self, order_id: str, *, subaccount: int = 0) -> dict:
+        self.target_cancelled = True
+        self.cancelled.append(order_id)
+        return {"order_id": order_id, "reduced_by": "1"}
+
+
+def test_bounded_exit_cancels_target_then_uses_reduce_only_ioc(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("KALSHI_LIVE_TRADING_ENABLED", LIVE_ENABLE_TOKEN)
+    now = datetime(2026, 7, 11, 2, tzinfo=UTC)
+    client = FakeBoundedExitClient(now)
+    clock = iter((0.0, 6.0))
+
+    result = execute_bounded_exit(
+        client,
+        exit_request(),
+        intent_id="test-intent-001",
+        audit_log=LiveAuditLog(tmp_path / "audit.jsonl"),
+        now=now,
+        monotonic=lambda: next(clock),
+        sleep=lambda _: None,
+    )
+
+    assert result["result"] == "fallback_submitted"
+    assert client.cancelled == ["order-1"]
+    assert len(client.created) == 2
+    fallback = client.created[1]
+    assert fallback["side"] == "ask"
+    assert fallback["price"] == "0.16"
+    assert fallback["reduce_only"] is True
+    assert fallback["post_only"] is False
+    assert fallback["time_in_force"] == "immediate_or_cancel"
+    assert result["remaining_position"] == "0"
+
+
+def test_bounded_exit_holds_when_bid_is_below_floor(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("KALSHI_LIVE_TRADING_ENABLED", LIVE_ENABLE_TOKEN)
+    now = datetime(2026, 7, 11, 2, tzinfo=UTC)
+    client = FakeBoundedExitClient(now, fallback_bid="0.14")
+    clock = iter((0.0, 6.0))
+
+    result = execute_bounded_exit(
+        client,
+        exit_request(),
+        intent_id="test-intent-001",
+        audit_log=LiveAuditLog(tmp_path / "audit.jsonl"),
+        now=now,
+        monotonic=lambda: next(clock),
+        sleep=lambda _: None,
+    )
+
+    assert result["result"] == "held_below_floor"
+    assert len(client.created) == 1
+    assert client.position == "1"
 
 
 def test_execute_requires_environment_kill_switch(monkeypatch, tmp_path) -> None:

@@ -24,10 +24,13 @@ from .fair_value import (
     StaticFairValue,
 )
 from .live_order import (
+    BOUNDED_EXIT_ACKNOWLEDGEMENT,
     LIVE_ACKNOWLEDGEMENT,
+    BoundedExitRequest,
     LiveAuditLog,
     LiveOrderRequest,
     LiveRiskLimits,
+    execute_bounded_exit,
     execute_live_order,
     preflight_live_order,
 )
@@ -576,7 +579,52 @@ def _print_live_preflight(payload: dict[str, object], *, json_output: bool) -> N
             ),
         )
     )
+    auto_exit = payload.get("auto_exit")
+    if isinstance(auto_exit, dict):
+        print("\nPreauthorized bounded exit")
+        print(
+            table(
+                ("FIELD", "VALUE"),
+                (
+                    ("Target ask", money(auto_exit["target_price"])),
+                    ("Target wait", f"{auto_exit['target_wait_seconds']} seconds"),
+                    ("Hard floor", money(auto_exit["floor_price"])),
+                    ("Fallback", "one reduce-only IOC at best bid, floor enforced"),
+                ),
+            )
+        )
     print("\nExecution requires explicit production credentials and all live safety gates.")
+
+
+def _bounded_exit_from_args(
+    args: argparse.Namespace,
+    *,
+    external_start_time: datetime,
+) -> BoundedExitRequest | None:
+    values = (args.auto_exit_target_cents, args.auto_exit_floor_cents)
+    if all(value is None for value in values):
+        return None
+    if any(value is None for value in values):
+        raise ValueError(
+            "auto-exit requires both --auto-exit-target-cents "
+            "and --auto-exit-floor-cents"
+        )
+    if args.side != "bid":
+        raise ValueError("bounded auto-exit is available only for a YES entry bid")
+    assert args.auto_exit_target_cents is not None
+    assert args.auto_exit_floor_cents is not None
+    request = BoundedExitRequest(
+        ticker=args.ticker,
+        target_price=args.auto_exit_target_cents / Decimal("100"),
+        floor_price=args.auto_exit_floor_cents / Decimal("100"),
+        count=args.count,
+        external_start_time=external_start_time,
+        target_wait_seconds=args.auto_exit_wait_seconds,
+    )
+    request.validate()
+    if request.target_price <= args.price_cents / Decimal("100"):
+        raise ValueError("auto-exit target must be above the entry price")
+    return request
 
 
 def _parse_live_time(value: str | None, *, argument: str) -> datetime:
@@ -653,6 +701,10 @@ def _cmd_live_order(args: argparse.Namespace) -> None:
     if not args.execute_live:
         client = _client()
         fair = _live_fair_snapshot(args, client)
+        bounded_exit = _bounded_exit_from_args(
+            args,
+            external_start_time=fair.event_commence_time,
+        )
         request = LiveOrderRequest(
             ticker=args.ticker,
             side=args.side,
@@ -668,7 +720,14 @@ def _cmd_live_order(args: argparse.Namespace) -> None:
             limits,
             authenticated=False,
         )
-        _print_live_preflight(preview.as_dict(), json_output=args.json)
+        payload = preview.as_dict()
+        if bounded_exit is not None:
+            payload["auto_exit"] = {
+                "target_price": str(bounded_exit.target_price),
+                "floor_price": str(bounded_exit.floor_price),
+                "target_wait_seconds": bounded_exit.target_wait_seconds,
+            }
+        _print_live_preflight(payload, json_output=args.json)
         return
 
     if args.acknowledge_risk != LIVE_ACKNOWLEDGEMENT:
@@ -682,6 +741,18 @@ def _cmd_live_order(args: argparse.Namespace) -> None:
     client = _production_client()
 
     fair = _live_fair_snapshot(args, client)
+    bounded_exit = _bounded_exit_from_args(
+        args,
+        external_start_time=fair.event_commence_time,
+    )
+    if (
+        bounded_exit is not None
+        and args.acknowledge_auto_exit != BOUNDED_EXIT_ACKNOWLEDGEMENT
+    ):
+        raise ValueError(
+            "bounded auto-exit requires --acknowledge-auto-exit "
+            f"{BOUNDED_EXIT_ACKNOWLEDGEMENT}"
+        )
     request = LiveOrderRequest(
         ticker=args.ticker,
         side=args.side,
@@ -701,12 +772,33 @@ def _cmd_live_order(args: argparse.Namespace) -> None:
         wait_seconds=args.wait_seconds,
         poll_seconds=args.poll_seconds,
     )
+    if bounded_exit is not None:
+        position = as_decimal(client.get_position(args.ticker, subaccount=0))
+        result["auto_exit"] = (
+            execute_bounded_exit(
+                client,
+                bounded_exit,
+                intent_id=args.intent_id,
+                audit_log=LiveAuditLog(args.audit_log),
+                poll_seconds=args.poll_seconds,
+            )
+            if position > Decimal("0")
+            else {"result": "not_needed_no_position"}
+        )
     if args.json:
         print(json.dumps(result))
     else:
         print(f"Live order result: {result['result']}")
         if result.get("order_id"):
             print(f"Order ID: {result['order_id']}")
+        if result.get("auto_exit"):
+            auto_exit = result["auto_exit"]
+            assert isinstance(auto_exit, dict)
+            print(f"Bounded exit result: {auto_exit['result']}")
+            if auto_exit.get("fallback_price"):
+                print(f"Fallback price: {money(auto_exit['fallback_price'])}")
+            if auto_exit.get("remaining_position") is not None:
+                print(f"Remaining position: {number(auto_exit['remaining_position'])}")
         print(f"Audit log: {args.audit_log}")
 
 
@@ -1025,6 +1117,10 @@ def build_parser() -> argparse.ArgumentParser:
     live_order.add_argument("--expiration-seconds", type=int, default=120)
     live_order.add_argument("--wait-seconds", type=int, default=60)
     live_order.add_argument("--poll-seconds", type=float, default=2)
+    live_order.add_argument("--auto-exit-target-cents", type=_decimal)
+    live_order.add_argument("--auto-exit-floor-cents", type=_decimal)
+    live_order.add_argument("--auto-exit-wait-seconds", type=int, default=60)
+    live_order.add_argument("--acknowledge-auto-exit")
     live_order.add_argument("--audit-log", type=Path, default=Path("logs/live-orders.jsonl"))
     live_order.add_argument("--execute-live", action="store_true")
     live_order.add_argument("--acknowledge-risk")

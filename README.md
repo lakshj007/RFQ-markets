@@ -180,7 +180,9 @@ The sample uses `post_only=true`, `cancel_order_on_pause=true`, `taker_at_cross`
 ## Guarded production order
 
 `live-order` means a real-money production order. It does not permit in-play trading,
-taker orders, continuous repricing, or automated two-sided production market making.
+continuous repricing, or automated two-sided production market making. Entries and
+normal exits are post-only. An optional bounded exit may make one reduce-only IOC sale
+after its target ask times out, but only at or above an explicitly confirmed floor.
 The hard-coded ceiling is one contract, at most $1 of entry cost, and at most one
 contract of absolute position.
 
@@ -250,12 +252,36 @@ kalshi-mm live-order \
 unset KALSHI_LIVE_TRADING_ENABLED
 ```
 
-Every submitted order is `post_only=true`, `cancel_order_on_pause=true`, uses
+Every entry and ordinary exit is `post_only=true`, `cancel_order_on_pause=true`, uses
 `taker_at_cross` self-trade prevention, and carries an exchange-side expiration. The
 command polls the order and cancels any remainder after its local timeout. It also
 attempts cancellation on interruption or error and writes an append-only audit trail
 to `logs/live-orders.jsonl`. If submission returns an ambiguous network error, it
 reconciles by client order ID and cancels any recovered resting order.
+
+An entry may include a preauthorized bounded exit. This posts one reduce-only target
+ask after an entry fill. If the target does not fill during the configured wait, the
+target is canceled and the current book is refreshed. The program then makes at most
+one reduce-only immediate-or-cancel sale at the best bid, provided that bid is at or
+above the hard floor. Otherwise it reports `held_below_floor` and leaves the position
+untouched. It never continuously reprices and cannot create a short position:
+
+```bash
+kalshi-mm live-order \
+  --ticker MARKET-TICKER \
+  --side bid \
+  --price-cents 58 \
+  --odds-sport basketball_nba_summer_league \
+  --auto-exit-target-cents 64 \
+  --auto-exit-floor-cents 55 \
+  --auto-exit-wait-seconds 60
+```
+
+Real execution additionally requires
+`--acknowledge-auto-exit BOUNDED_REDUCE_ONLY_EXIT`. The fallback can pay a taker fee;
+its estimated fee, price, response, and remaining position are written to the audit
+log. If the process stops after an ambiguous entry submission, run `live-status` before
+attempting recovery rather than assuming the entry did not fill.
 
 Manual fair values are supported only when accompanied by an ISO-8601 observation
 timestamp no more than 60 seconds old and a timezone-qualified independent event start:

@@ -16,6 +16,7 @@ from .models import ONE, ZERO, OrderBook, PriceGrid, as_decimal
 
 LIVE_ENABLE_TOKEN = "I_UNDERSTAND_REAL_MONEY"
 LIVE_ACKNOWLEDGEMENT = "REAL_MONEY_ONE_CONTRACT"
+BOUNDED_EXIT_ACKNOWLEDGEMENT = "BOUNDED_REDUCE_ONLY_EXIT"
 HARD_MAX_CONTRACTS = Decimal("1")
 HARD_MAX_ORDER_COST = Decimal("1")
 HARD_MIN_EDGE = Decimal("0.02")
@@ -24,6 +25,7 @@ HARD_MAX_QUEUE_AHEAD = Decimal("500")
 HARD_MAX_TRADE_AGE_SECONDS = 900
 HARD_MAX_EXPIRATION_SECONDS = 300
 MAKER_FEE_RATE = Decimal("0.0175")
+TAKER_FEE_RATE = Decimal("0.07")
 INTENT_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{7,39}$")
 
 
@@ -62,6 +64,7 @@ class LiveOrderClient(Protocol):
         subaccount: int = 0,
         post_only: bool = True,
         cancel_order_on_pause: bool = True,
+        time_in_force: str = "good_till_canceled",
     ) -> dict[str, Any]: ...
 
     def cancel_order(self, order_id: str, *, subaccount: int = 0) -> dict[str, Any]: ...
@@ -172,6 +175,63 @@ class LiveOrderRequest:
             raise ValueError("expiration must be at least 10 seconds")
         if self.subaccount != 0:
             raise ValueError("only the primary subaccount is enabled for live testing")
+
+
+@dataclass(frozen=True, slots=True)
+class BoundedExitRequest:
+    ticker: str
+    target_price: Decimal
+    floor_price: Decimal
+    count: Decimal
+    external_start_time: datetime
+    target_wait_seconds: int = 60
+    subaccount: int = 0
+
+    def validate(self) -> None:
+        if not ZERO < self.floor_price <= self.target_price < ONE:
+            raise ValueError("exit prices must satisfy 0 < floor <= target < 1")
+        if not ZERO < self.count <= HARD_MAX_CONTRACTS:
+            raise ValueError("bounded exit count must be in (0, 1]")
+        if not 5 <= self.target_wait_seconds <= 240:
+            raise ValueError("target wait must be between 5 and 240 seconds")
+        if self.external_start_time.tzinfo is None:
+            raise ValueError("external start time must include a timezone")
+        if self.subaccount != 0:
+            raise ValueError("only the primary subaccount is enabled for live testing")
+
+
+@dataclass(frozen=True, slots=True)
+class BoundedExitPreflight:
+    ticker: str
+    target_price: Decimal
+    floor_price: Decimal
+    count: Decimal
+    best_bid: Decimal
+    best_ask: Decimal
+    fallback_price: Decimal | None
+    estimated_fallback_fee: Decimal | None
+    effective_start_time: datetime
+    position: Decimal
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "ticker": self.ticker,
+            "target_price": str(self.target_price),
+            "floor_price": str(self.floor_price),
+            "count": str(self.count),
+            "best_bid": str(self.best_bid),
+            "best_ask": str(self.best_ask),
+            "fallback_price": (
+                str(self.fallback_price) if self.fallback_price is not None else None
+            ),
+            "estimated_fallback_fee": (
+                str(self.estimated_fallback_fee)
+                if self.estimated_fallback_fee is not None
+                else None
+            ),
+            "effective_start_time": self.effective_start_time.isoformat(),
+            "position": str(self.position),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,6 +353,90 @@ def _maximum_maker_fee(
         * (ONE - request.price)
     )
     return raw_fee.quantize(Decimal("0.01"), rounding=ROUND_CEILING)
+
+
+def _maximum_taker_fee(
+    market: dict[str, Any],
+    series: dict[str, Any],
+    *,
+    price: Decimal,
+    count: Decimal,
+) -> Decimal:
+    fee_type = str(series.get("fee_type", ""))
+    if fee_type not in {"quadratic", "quadratic_with_maker_fees"}:
+        raise ValueError(f"unsupported or unknown live taker fee type: {fee_type or 'missing'}")
+    multiplier = as_decimal(series.get("fee_multiplier", "0"))
+    if not ZERO < multiplier <= ONE:
+        raise ValueError("live taker fee multiplier must be in (0, 1]")
+    waiver_expiration = _parse_time(market.get("fee_waiver_expiration_time"))
+    if waiver_expiration is not None and waiver_expiration >= datetime.now(UTC):
+        return ZERO
+    raw_fee = TAKER_FEE_RATE * multiplier * count * price * (ONE - price)
+    return raw_fee.quantize(Decimal("0.01"), rounding=ROUND_CEILING)
+
+
+def preflight_bounded_exit(
+    client: LiveOrderClient,
+    request: BoundedExitRequest,
+    *,
+    now: datetime | None = None,
+    require_no_resting_orders: bool = True,
+    require_target_post_only: bool = True,
+) -> BoundedExitPreflight:
+    request.validate()
+    now = now or datetime.now(UTC)
+    market = client.get_market(request.ticker)
+    if market.get("status") != "active":
+        raise ValueError("market is not active")
+    market_start = _parse_time(market.get("occurrence_datetime"))
+    if market_start is None:
+        raise ValueError("market occurrence time is missing or invalid")
+    effective_start = min(market_start, request.external_start_time.astimezone(UTC))
+    if effective_start <= now + timedelta(minutes=5):
+        raise ValueError("bounded exits stop five minutes before start")
+    grid = PriceGrid.from_market(market)
+    for price in (request.target_price, request.floor_price):
+        if grid.floor(price) != price or grid.ceil(price) != price:
+            raise ValueError("exit price is not valid on the market price grid")
+    book = OrderBook.from_api(client.get_orderbook(request.ticker, depth=1))
+    if book.best_bid is None or book.best_ask is None:
+        raise ValueError("bounded exit requires a two-sided order book")
+    if require_target_post_only and request.target_price <= book.best_bid.price:
+        raise ValueError("target ask must be post-only above the current best bid")
+    if require_no_resting_orders:
+        resting = client.get_orders(status="resting", subaccount=request.subaccount, limit=1000)
+        if resting:
+            raise ValueError("cancel or reconcile all resting production orders first")
+    position = as_decimal(client.get_position(request.ticker, subaccount=request.subaccount))
+    if position < request.count:
+        raise ValueError("bounded exit requires the confirmed YES position")
+    event_ticker = str(market.get("event_ticker", request.ticker))
+    series = client.get_series_details(event_ticker.split("-", 1)[0])
+    fallback_price = (
+        book.best_bid.price if book.best_bid.price >= request.floor_price else None
+    )
+    fallback_fee = (
+        _maximum_taker_fee(
+            market,
+            series,
+            price=fallback_price,
+            count=request.count,
+        )
+        if fallback_price is not None
+        else None
+    )
+    return BoundedExitPreflight(
+        ticker=request.ticker,
+        target_price=request.target_price,
+        floor_price=request.floor_price,
+        count=request.count,
+        best_bid=book.best_bid.price,
+        best_ask=book.best_ask.price,
+        fallback_price=fallback_price,
+        estimated_fallback_fee=fallback_fee,
+        effective_start_time=effective_start,
+        position=position,
+    )
 
 
 def preflight_live_order(
@@ -584,3 +728,154 @@ def execute_live_order(
                         "cancel_on_exit_failed",
                         {"order_id": order_id, "error": str(exc)},
                     )
+
+
+def execute_bounded_exit(
+    client: LiveOrderClient,
+    request: BoundedExitRequest,
+    *,
+    intent_id: str,
+    audit_log: LiveAuditLog,
+    poll_seconds: float = 2,
+    now: datetime | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> dict[str, object]:
+    if os.getenv("KALSHI_LIVE_TRADING_ENABLED") != LIVE_ENABLE_TOKEN:
+        raise ValueError(
+            f"set KALSHI_LIVE_TRADING_ENABLED={LIVE_ENABLE_TOKEN} to enable real orders"
+        )
+    live_client_order_id(intent_id)
+    if not 0.25 <= poll_seconds <= 10:
+        raise ValueError("poll seconds must be between 0.25 and 10")
+    effective_now = now or datetime.now(UTC)
+    preflight = preflight_bounded_exit(client, request, now=effective_now)
+    audit_log.append("bounded_exit_validated", {"preflight": preflight.as_dict()})
+
+    target_client_id = f"manual-exit-target-{intent_id}"
+    target_response = client.create_order(
+        ticker=request.ticker,
+        client_order_id=target_client_id,
+        side="ask",
+        count=format(request.count, "f"),
+        price=format(request.target_price, "f"),
+        expiration_time=int(effective_now.timestamp()) + request.target_wait_seconds + 30,
+        reduce_only=True,
+        subaccount=request.subaccount,
+        post_only=True,
+        cancel_order_on_pause=True,
+        time_in_force="good_till_canceled",
+    )
+    target_order_id = str(target_response["order_id"])
+    audit_log.append(
+        "bounded_exit_target_submitted",
+        {"order_id": target_order_id, "response": target_response},
+    )
+    target_remaining = as_decimal(target_response.get("remaining_count", request.count))
+    if target_remaining <= ZERO:
+        result = {
+            "result": "target_filled",
+            "target_order_id": target_order_id,
+            "response": target_response,
+        }
+        audit_log.append("bounded_exit_terminal", result)
+        return result
+
+    deadline = monotonic() + request.target_wait_seconds
+    target_terminal = False
+    try:
+        while monotonic() < deadline:
+            orders = client.get_orders(
+                ticker=request.ticker,
+                subaccount=request.subaccount,
+                limit=1000,
+            )
+            current = next(
+                (item for item in orders if item.get("order_id") == target_order_id),
+                None,
+            )
+            if current and current.get("status") != "resting":
+                target_terminal = True
+                break
+            sleep(poll_seconds)
+        if not target_terminal:
+            cancellation = client.cancel_order(
+                target_order_id,
+                subaccount=request.subaccount,
+            )
+            target_terminal = True
+            audit_log.append(
+                "bounded_exit_target_cancelled",
+                {"order_id": target_order_id, "cancellation": cancellation},
+            )
+    finally:
+        if not target_terminal:
+            try:
+                client.cancel_order(target_order_id, subaccount=request.subaccount)
+            except KalshiAPIError as exc:
+                if exc.status_code != 404:
+                    raise
+
+    remaining_position = as_decimal(
+        client.get_position(request.ticker, subaccount=request.subaccount)
+    )
+    if remaining_position <= ZERO:
+        result = {"result": "target_filled", "target_order_id": target_order_id}
+        audit_log.append("bounded_exit_terminal", result)
+        return result
+
+    fallback_request = BoundedExitRequest(
+        ticker=request.ticker,
+        target_price=request.target_price,
+        floor_price=request.floor_price,
+        count=min(remaining_position, request.count),
+        external_start_time=request.external_start_time,
+        target_wait_seconds=request.target_wait_seconds,
+        subaccount=request.subaccount,
+    )
+    fallback = preflight_bounded_exit(
+        client,
+        fallback_request,
+        now=effective_now if now is not None else None,
+        require_target_post_only=False,
+    )
+    if fallback.fallback_price is None:
+        result = {
+            "result": "held_below_floor",
+            "best_bid": str(fallback.best_bid),
+            "floor_price": str(request.floor_price),
+            "remaining_position": str(remaining_position),
+        }
+        audit_log.append("bounded_exit_terminal", result)
+        return result
+
+    fallback_client_id = f"manual-exit-fallback-{intent_id}"
+    fallback_response = client.create_order(
+        ticker=request.ticker,
+        client_order_id=fallback_client_id,
+        side="ask",
+        count=format(fallback_request.count, "f"),
+        price=format(fallback.fallback_price, "f"),
+        expiration_time=None,
+        reduce_only=True,
+        subaccount=request.subaccount,
+        post_only=False,
+        cancel_order_on_pause=True,
+        time_in_force="immediate_or_cancel",
+    )
+    final_position = as_decimal(
+        client.get_position(request.ticker, subaccount=request.subaccount)
+    )
+    result = {
+        "result": "fallback_submitted",
+        "fallback_price": str(fallback.fallback_price),
+        "estimated_fee": (
+            str(fallback.estimated_fallback_fee)
+            if fallback.estimated_fallback_fee is not None
+            else None
+        ),
+        "response": fallback_response,
+        "remaining_position": str(final_position),
+    }
+    audit_log.append("bounded_exit_terminal", result)
+    return result
