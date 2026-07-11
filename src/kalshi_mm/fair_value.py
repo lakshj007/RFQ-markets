@@ -47,6 +47,13 @@ class JsonFileFairValue:
         return _validate_probability(as_decimal(payload[ticker]))
 
 
+@dataclass(frozen=True, slots=True)
+class OddsFairSnapshot:
+    probability: Decimal
+    event_commence_time: datetime
+    observed_at: datetime
+
+
 @dataclass(slots=True)
 class OddsConsensusFairValue:
     """Refresh a no-vig sportsbook consensus on a bounded polling interval."""
@@ -65,6 +72,7 @@ class OddsConsensusFairValue:
     _cached_probability: Decimal | None = None
     _last_refresh: float = 0
     _event_commence_time: datetime | None = None
+    _observed_at: datetime | None = None
 
     def _refresh(self) -> Decimal:
         market = self.kalshi.get_market(self.market_ticker)
@@ -100,6 +108,7 @@ class OddsConsensusFairValue:
         if consensus is None:
             raise ValueError(f"not enough fresh sportsbook prices for {self.market_ticker}")
         self._cached_probability = _validate_probability(consensus.fair_probability)
+        self._observed_at = now
         self._last_refresh = time.monotonic()
         return self._cached_probability
 
@@ -118,3 +127,13 @@ class OddsConsensusFairValue:
         if self._cached_probability is None or stale:
             return self._refresh()
         return self._cached_probability
+
+    def snapshot(self, ticker: str) -> OddsFairSnapshot:
+        probability = self.get(ticker)
+        if self._event_commence_time is None or self._observed_at is None:
+            raise RuntimeError("odds fair-value snapshot is incomplete")
+        return OddsFairSnapshot(
+            probability=probability,
+            event_commence_time=self._event_commence_time,
+            observed_at=self._observed_at,
+        )

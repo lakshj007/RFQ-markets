@@ -7,7 +7,7 @@ from decimal import Decimal
 from statistics import median
 
 from .client import KalshiClient
-from .matching import EventMatch, best_outcome_match, match_events
+from .matching import DRAW_OUTCOMES, EventMatch, best_outcome_match, match_events, normalize_name
 from .models import OrderBook, as_decimal
 from .odds import DEFAULT_SHARP_BOOKMAKERS, BookmakerOdds, OddsClient, OddsEvent, OddsMarket
 
@@ -39,6 +39,35 @@ class Discrepancy:
     yes_ask_size: Decimal = Decimal("0")
     market_type: str = "h2h"
     line: Decimal | None = None
+    direct_yes_bid: Decimal | None = None
+    direct_yes_ask: Decimal | None = None
+    effective_bid_route: str | None = None
+    effective_ask_route: str | None = None
+    complement_ticker: str | None = None
+    action_route: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class EffectiveTopOfBook:
+    bid: Decimal
+    ask: Decimal
+    bid_size: Decimal
+    ask_size: Decimal
+    bid_route: str
+    ask_route: str
+    complement_ticker: str | None = None
+
+    @property
+    def midpoint(self) -> Decimal:
+        return (self.bid + self.ask) / 2
+
+
+@dataclass(frozen=True, slots=True)
+class _PricedMoneyline:
+    ticker: str
+    outcome: str
+    consensus: ConsensusPrice
+    book: OrderBook
 
 
 _FULL_GAME_TOTAL_PATTERN = re.compile(
@@ -69,6 +98,86 @@ def parse_full_game_total_line(
 
 def _market_for(bookmaker: BookmakerOdds, market_key: str) -> OddsMarket | None:
     return next((market for market in bookmaker.markets if market.key == market_key), None)
+
+
+def _merge_level(
+    direct_price: Decimal,
+    direct_size: Decimal,
+    direct_route: str,
+    synthetic_price: Decimal,
+    synthetic_size: Decimal,
+    synthetic_route: str,
+    *,
+    prefer_higher: bool,
+) -> tuple[Decimal, Decimal, str]:
+    if synthetic_price == direct_price:
+        return direct_price, direct_size + synthetic_size, f"{direct_route}|{synthetic_route}"
+    use_synthetic = (
+        synthetic_price > direct_price if prefer_higher else synthetic_price < direct_price
+    )
+    if use_synthetic:
+        return synthetic_price, synthetic_size, synthetic_route
+    return direct_price, direct_size, direct_route
+
+
+def combine_complementary_books(
+    ticker: str,
+    book: OrderBook,
+    complement_ticker: str,
+    complement_book: OrderBook,
+) -> EffectiveTopOfBook | None:
+    """Merge YES with the other outcome's economically equivalent NO book."""
+    if (
+        book.best_bid is None
+        or book.best_ask is None
+        or complement_book.best_bid is None
+        or complement_book.best_ask is None
+    ):
+        return None
+    direct_route = f"{ticker}:YES"
+    complement_route = f"{complement_ticker}:NO"
+    bid, bid_size, bid_route = _merge_level(
+        book.best_bid.price,
+        book.best_bid.size,
+        direct_route,
+        Decimal("1") - complement_book.best_ask.price,
+        complement_book.best_ask.size,
+        complement_route,
+        prefer_higher=True,
+    )
+    ask, ask_size, ask_route = _merge_level(
+        book.best_ask.price,
+        book.best_ask.size,
+        direct_route,
+        Decimal("1") - complement_book.best_bid.price,
+        complement_book.best_bid.size,
+        complement_route,
+        prefer_higher=False,
+    )
+    return EffectiveTopOfBook(
+        bid=bid,
+        ask=ask,
+        bid_size=bid_size,
+        ask_size=ask_size,
+        bid_route=bid_route,
+        ask_route=ask_route,
+        complement_ticker=complement_ticker,
+    )
+
+
+def _is_two_outcome_moneyline(event: OddsEvent) -> bool:
+    found = False
+    for bookmaker in event.bookmakers:
+        market = _market_for(bookmaker, "h2h")
+        if market is None:
+            continue
+        outcomes = [item for item in market.outcomes if item.price > 1]
+        if len(outcomes) != 2:
+            return False
+        if any(normalize_name(item.name) in DRAW_OUTCOMES for item in outcomes):
+            return False
+        found = True
+    return found
 
 
 def consensus_probability(
@@ -164,35 +273,53 @@ def _priced_discrepancy(
     min_edge: Decimal,
     market_type: str,
     line: Decimal | None = None,
+    book: OrderBook | None = None,
+    effective_book: EffectiveTopOfBook | None = None,
 ) -> Discrepancy | None:
-    book = OrderBook.from_api(kalshi.get_orderbook(ticker, depth=1))
+    book = book or OrderBook.from_api(kalshi.get_orderbook(ticker, depth=1))
     if book.best_bid is None or book.best_ask is None or book.midpoint is None:
         return None
-    buy_edge = consensus.fair_probability - book.best_ask.price
-    sell_edge = book.best_bid.price - consensus.fair_probability
+    effective_book = effective_book or EffectiveTopOfBook(
+        bid=book.best_bid.price,
+        ask=book.best_ask.price,
+        bid_size=book.best_bid.size,
+        ask_size=book.best_ask.size,
+        bid_route=f"{ticker}:YES",
+        ask_route=f"{ticker}:YES",
+    )
+    buy_edge = consensus.fair_probability - effective_book.ask
+    sell_edge = effective_book.bid - consensus.fair_probability
     if buy_edge >= sell_edge:
         action = "BUY YES" if buy_edge >= min_edge else "NONE"
         edge = buy_edge
+        action_route = effective_book.ask_route if action != "NONE" else None
     else:
         action = "SELL YES" if sell_edge >= min_edge else "NONE"
         edge = sell_edge
+        action_route = effective_book.bid_route if action != "NONE" else None
     return Discrepancy(
         ticker=ticker,
         event_ticker=str(match.kalshi_event.get("event_ticker", "")),
         outcome=outcome,
         odds_event_id=match.odds_event.event_id,
         fair_probability=consensus.fair_probability,
-        yes_bid=book.best_bid.price,
-        yes_ask=book.best_ask.price,
-        midpoint=book.midpoint,
+        yes_bid=effective_book.bid,
+        yes_ask=effective_book.ask,
+        midpoint=effective_book.midpoint,
         action=action,
         edge=edge,
         bookmaker_count=consensus.bookmaker_count,
         match_score=match.score,
-        yes_bid_size=book.best_bid.size,
-        yes_ask_size=book.best_ask.size,
+        yes_bid_size=effective_book.bid_size,
+        yes_ask_size=effective_book.ask_size,
         market_type=market_type,
         line=line,
+        direct_yes_bid=book.best_bid.price,
+        direct_yes_ask=book.best_ask.price,
+        effective_bid_route=effective_book.bid_route,
+        effective_ask_route=effective_book.ask_route,
+        complement_ticker=effective_book.complement_ticker,
+        action_route=action_route,
     )
 
 
@@ -205,8 +332,8 @@ def _scan_moneyline_match(
     max_odds_age_seconds: float,
     now: datetime,
 ) -> list[Discrepancy]:
-    results: list[Discrepancy] = []
     event = match.kalshi_event
+    priced: list[_PricedMoneyline] = []
     for market in event.get("markets", []):
         ticker = str(market.get("ticker", ""))
         outcome = str(market.get("yes_sub_title", ""))
@@ -221,14 +348,33 @@ def _scan_moneyline_match(
         )
         if consensus is None:
             continue
+        book = OrderBook.from_api(kalshi.get_orderbook(ticker, depth=1))
+        if book.best_bid is None or book.best_ask is None:
+            continue
+        priced.append(_PricedMoneyline(ticker, outcome, consensus, book))
+
+    results: list[Discrepancy] = []
+    use_complements = len(priced) == 2 and _is_two_outcome_moneyline(match.odds_event)
+    for index, item in enumerate(priced):
+        effective_book = None
+        if use_complements:
+            complement = priced[1 - index]
+            effective_book = combine_complementary_books(
+                item.ticker,
+                item.book,
+                complement.ticker,
+                complement.book,
+            )
         discrepancy = _priced_discrepancy(
             kalshi,
             match,
-            ticker=ticker,
-            outcome=outcome,
-            consensus=consensus,
+            ticker=item.ticker,
+            outcome=item.outcome,
+            consensus=item.consensus,
             min_edge=min_edge,
             market_type="h2h",
+            book=item.book,
+            effective_book=effective_book,
         )
         if discrepancy is not None:
             results.append(discrepancy)

@@ -220,6 +220,12 @@ edge. Sharp-book prices must be no more than 60 seconds old. Execution also requ
 sufficient balance, no existing resting production orders, and compliance with the
 one-contract position limit.
 
+For sportsbook-backed fair values, the matched sportsbook event start is carried into
+the live request as an independent start time. The pregame gate uses whichever is
+earlier: that independent start or Kalshi's occurrence timestamp. The preview prints
+both timestamps and their offset, so a late Kalshi timestamp cannot accidentally keep
+the order path enabled after the actual game begins.
+
 After reviewing the preview, submit the exact same order with all real-money gates.
 Use a unique intent ID and reuse that ID if a command must be retried; the client will
 reconcile an existing matching order instead of submitting a duplicate:
@@ -250,7 +256,7 @@ to `logs/live-orders.jsonl`. If submission returns an ambiguous network error, i
 reconciles by client order ID and cancels any recovered resting order.
 
 Manual fair values are supported only when accompanied by an ISO-8601 observation
-timestamp no more than 60 seconds old:
+timestamp no more than 60 seconds old and a timezone-qualified independent event start:
 
 ```bash
 kalshi-mm live-order \
@@ -258,7 +264,8 @@ kalshi-mm live-order \
   --side bid \
   --price-cents 16 \
   --fair-probability 0.19 \
-  --fair-observed-at 2026-07-11T02:00:00Z
+  --fair-observed-at 2026-07-11T02:00:00Z \
+  --external-start-time 2026-07-11T04:00:00Z
 ```
 
 Asks are reduce-only and require an existing YES position. A risk-reducing exit may
@@ -309,6 +316,12 @@ totals. A totals comparison requires the same event and exact numerical line at 
 bookmaker; books quoting a different line are ignored. Team totals, first-half/period
 totals, player props, spreads, and advancement markets remain excluded rather than
 assuming their settlement rules are equivalent.
+
+For a true two-outcome game, the scanner also merges each team's YES book with the
+other team's economically equivalent NO book. Displayed bids, asks, spreads, and edges
+are therefore the best effective prices across both execution routes. JSON output keeps
+the direct prices and identifies the effective bid/ask route. Events with a draw or more
+than two outcomes are never synthesized this way.
 
 ## Paper signals and markouts
 

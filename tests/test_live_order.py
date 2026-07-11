@@ -17,6 +17,7 @@ from kalshi_mm.live_order import (
 class FakeLiveClient:
     def __init__(self, now: datetime) -> None:
         self.now = now
+        self.market_start_offset = timedelta(hours=1)
         self.position = "0"
         self.balance = 1000
         self.existing_orders: list[dict] = []
@@ -28,7 +29,7 @@ class FakeLiveClient:
             "ticker": ticker,
             "title": "Seattle vs Portland Winner?",
             "status": "active",
-            "occurrence_datetime": (self.now + timedelta(hours=1)).isoformat(),
+            "occurrence_datetime": (self.now + self.market_start_offset).isoformat(),
             "price_ranges": [{"start": "0", "end": "1", "step": "0.01"}],
         }
 
@@ -107,6 +108,7 @@ def request() -> LiveOrderRequest:
         price=Decimal("0.16"),
         count=Decimal("1"),
         fair_probability=Decimal("0.19"),
+        external_start_time=datetime(2026, 7, 11, 3, tzinfo=UTC),
         expiration_seconds=120,
     )
 
@@ -124,6 +126,10 @@ def test_public_preflight_requires_recent_flow_and_edge() -> None:
     assert result.modeled_edge == Decimal("0.03")
     assert result.recent_contracts == Decimal("14")
     assert result.queue_ahead == Decimal("93")
+    assert result.market_occurrence_time == now + timedelta(hours=1)
+    assert result.external_start_time == now + timedelta(hours=1)
+    assert result.effective_start_time == now + timedelta(hours=1)
+    assert result.order_expiration_time == now + timedelta(seconds=120)
     assert result.position is None
     assert result.available_balance is None
 
@@ -137,6 +143,7 @@ def test_preflight_rejects_crossing_and_insufficient_edge() -> None:
         price=Decimal("0.17"),
         count=Decimal("1"),
         fair_probability=Decimal("0.20"),
+        external_start_time=now + timedelta(hours=1),
         expiration_seconds=120,
     )
     low_edge = LiveOrderRequest(
@@ -145,6 +152,7 @@ def test_preflight_rejects_crossing_and_insufficient_edge() -> None:
         price=Decimal("0.16"),
         count=Decimal("1"),
         fair_probability=Decimal("0.17"),
+        external_start_time=now + timedelta(hours=1),
         expiration_seconds=120,
     )
 
@@ -164,6 +172,7 @@ def test_reduce_only_ask_can_exit_without_positive_edge() -> None:
         price=Decimal("0.17"),
         count=Decimal("1"),
         fair_probability=Decimal("0.19"),
+        external_start_time=now + timedelta(hours=1),
         expiration_seconds=120,
     )
 
@@ -188,6 +197,7 @@ def test_preflight_rejects_noncompetitive_price_and_large_queue() -> None:
         price=Decimal("0.15"),
         count=Decimal("1"),
         fair_probability=Decimal("0.19"),
+        external_start_time=now + timedelta(hours=1),
         expiration_seconds=120,
     )
 
@@ -207,6 +217,56 @@ def test_preflight_rejects_noncompetitive_price_and_large_queue() -> None:
             authenticated=False,
             now=now,
         )
+
+
+def test_preflight_uses_earlier_independent_start_time() -> None:
+    now = datetime(2026, 7, 11, 2, tzinfo=UTC)
+    client = FakeLiveClient(now)
+    client.market_start_offset = timedelta(hours=3, minutes=4)
+    live_request = LiveOrderRequest(
+        ticker="MARKET",
+        side="bid",
+        price=Decimal("0.16"),
+        count=Decimal("1"),
+        fair_probability=Decimal("0.19"),
+        external_start_time=now + timedelta(minutes=4),
+        expiration_seconds=120,
+    )
+
+    with pytest.raises(ValueError, match="stops five minutes before start"):
+        preflight_live_order(
+            client,
+            live_request,
+            LiveRiskLimits(),
+            authenticated=False,
+            now=now,
+        )
+
+
+def test_preflight_reports_three_hour_market_start_offset() -> None:
+    now = datetime(2026, 7, 11, 2, tzinfo=UTC)
+    client = FakeLiveClient(now)
+    client.market_start_offset = timedelta(hours=4)
+    live_request = LiveOrderRequest(
+        ticker="MARKET",
+        side="bid",
+        price=Decimal("0.16"),
+        count=Decimal("1"),
+        fair_probability=Decimal("0.19"),
+        external_start_time=now + timedelta(hours=1),
+        expiration_seconds=120,
+    )
+
+    result = preflight_live_order(
+        client,
+        live_request,
+        LiveRiskLimits(),
+        authenticated=False,
+        now=now,
+    )
+
+    assert result.effective_start_time == now + timedelta(hours=1)
+    assert result.start_time_delta_seconds == 3 * 60 * 60
 
 
 def test_execute_requires_environment_kill_switch(monkeypatch, tmp_path) -> None:

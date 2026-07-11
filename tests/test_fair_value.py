@@ -62,8 +62,12 @@ def test_odds_consensus_fair_value_is_cached_between_book_updates() -> None:
 
     first = source.get("MARKET")
     second = source.get("MARKET")
+    snapshot = source.snapshot("MARKET")
 
     assert Decimal("0.5") < first < Decimal("0.55")
     assert second == first
+    assert snapshot.probability == first
+    assert snapshot.event_commence_time == _two_book_event().commence_time
+    assert snapshot.observed_at.tzinfo is not None
     assert odds.calls == 1
     assert odds.bookmakers == DEFAULT_SHARP_BOOKMAKERS

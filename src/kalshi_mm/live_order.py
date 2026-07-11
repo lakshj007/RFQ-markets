@@ -150,6 +150,7 @@ class LiveOrderRequest:
     price: Decimal
     count: Decimal
     fair_probability: Decimal
+    external_start_time: datetime
     expiration_seconds: int
     subaccount: int = 0
 
@@ -162,6 +163,8 @@ class LiveOrderRequest:
             raise ValueError("count must be positive")
         if not ZERO < self.fair_probability < ONE:
             raise ValueError("fair probability must be strictly between 0 and 1")
+        if self.external_start_time.tzinfo is None:
+            raise ValueError("external start time must include a timezone")
         if self.expiration_seconds < 10:
             raise ValueError("expiration must be at least 10 seconds")
         if self.subaccount != 0:
@@ -180,7 +183,11 @@ class LivePreflight:
     best_bid: Decimal
     best_ask: Decimal
     spread: Decimal
-    occurrence_time: datetime
+    market_occurrence_time: datetime
+    external_start_time: datetime
+    effective_start_time: datetime
+    start_time_delta_seconds: int
+    order_expiration_time: datetime
     latest_trade_time: datetime
     recent_contracts: Decimal
     queue_ahead: Decimal
@@ -200,7 +207,11 @@ class LivePreflight:
             "best_bid": str(self.best_bid),
             "best_ask": str(self.best_ask),
             "spread": str(self.spread),
-            "occurrence_time": self.occurrence_time.isoformat(),
+            "market_occurrence_time": self.market_occurrence_time.isoformat(),
+            "external_start_time": self.external_start_time.isoformat(),
+            "effective_start_time": self.effective_start_time.isoformat(),
+            "start_time_delta_seconds": self.start_time_delta_seconds,
+            "order_expiration_time": self.order_expiration_time.isoformat(),
             "latest_trade_time": self.latest_trade_time.isoformat(),
             "recent_contracts": str(self.recent_contracts),
             "queue_ahead": str(self.queue_ahead),
@@ -268,10 +279,12 @@ def preflight_live_order(
     market = client.get_market(request.ticker)
     if market.get("status") != "active":
         raise ValueError("market is not active")
-    occurrence = _parse_time(market.get("occurrence_datetime"))
-    if occurrence is None:
+    market_occurrence = _parse_time(market.get("occurrence_datetime"))
+    if market_occurrence is None:
         raise ValueError("market occurrence time is missing or invalid")
-    if occurrence <= now + timedelta(minutes=5):
+    external_start = request.external_start_time.astimezone(UTC)
+    effective_start = min(market_occurrence, external_start)
+    if effective_start <= now + timedelta(minutes=5):
         raise ValueError("live testing is pregame-only and stops five minutes before start")
 
     grid = PriceGrid.from_market(market)
@@ -345,7 +358,11 @@ def preflight_live_order(
         best_bid=book.best_bid.price,
         best_ask=book.best_ask.price,
         spread=book.spread,
-        occurrence_time=occurrence,
+        market_occurrence_time=market_occurrence,
+        external_start_time=external_start,
+        effective_start_time=effective_start,
+        start_time_delta_seconds=int((market_occurrence - external_start).total_seconds()),
+        order_expiration_time=now + timedelta(seconds=request.expiration_seconds),
         latest_trade_time=latest_trade,
         recent_contracts=recent_contracts,
         queue_ahead=queue_ahead,
@@ -398,7 +415,7 @@ def execute_live_order(
         return result
 
     preflight = preflight_live_order(client, request, limits, authenticated=True, now=now)
-    expiration_time = int((now or datetime.now(UTC)).timestamp()) + request.expiration_seconds
+    expiration_time = int(preflight.order_expiration_time.timestamp())
     audit_log.append(
         "intent_validated",
         {"client_order_id": client_order_id, "preflight": preflight.as_dict()},

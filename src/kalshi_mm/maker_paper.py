@@ -393,9 +393,10 @@ class MakerPaperRecorder:
         if available <= 0:
             return 0
         active_tickers = {item.ticker for item in open_quotes}
+        active_events = {item.event_ticker for item in open_quotes}
         candidates: list[tuple[Decimal, Discrepancy, Decimal, Decimal]] = []
         for item in snapshots:
-            if item.ticker in active_tickers:
+            if item.ticker in active_tickers or item.event_ticker in active_events:
                 continue
             prices = self._candidate(item)
             if prices is None:
@@ -404,7 +405,11 @@ class MakerPaperRecorder:
             candidates.append((item.yes_ask - item.yes_bid, item, bid, ask))
         candidates.sort(key=lambda value: (value[0], value[1].bookmaker_count), reverse=True)
         opened = 0
-        for spread, item, bid, ask in candidates[:available]:
+        for spread, item, bid, ask in candidates:
+            if opened >= available:
+                break
+            if item.event_ticker in active_events:
+                continue
             quote = SimulatedQuote(
                 quote_id=str(uuid.uuid4()),
                 ticker=item.ticker,
@@ -421,6 +426,7 @@ class MakerPaperRecorder:
                 ask_top_size=item.yes_ask_size,
             )
             self.quotes.append(quote)
+            active_events.add(item.event_ticker)
             self._append(
                 {
                     "record_type": "quote_opened",

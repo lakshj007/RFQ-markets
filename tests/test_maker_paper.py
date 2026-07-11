@@ -170,3 +170,17 @@ def test_maker_paper_rejects_placeholder_wide_spread(tmp_path) -> None:
 
     assert update.quotes_opened == 0
     assert update.active_quotes == 0
+
+
+def test_maker_paper_opens_only_one_complementary_contract_per_event(tmp_path) -> None:
+    recorder = MakerPaperRecorder(
+        tmp_path / "maker.jsonl",
+        tmp_path / "maker-state.json",
+        max_open_quotes=5,
+    )
+    complement = replace(snapshot(), ticker="OTHER", outcome="Other team")
+
+    update = recorder.update([snapshot(), complement], trades=FakeTrades())
+
+    assert update.quotes_opened == 1
+    assert update.active_quotes == 1

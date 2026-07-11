@@ -20,6 +20,7 @@ from .fair_value import (
     FairValueSource,
     JsonFileFairValue,
     OddsConsensusFairValue,
+    OddsFairSnapshot,
     StaticFairValue,
 )
 from .live_order import (
@@ -311,6 +312,16 @@ def _discrepancy_dict(item: Discrepancy) -> dict[str, object]:
         "market_type": item.market_type,
         "line": str(item.line) if item.line is not None else None,
         "spread": str(item.yes_ask - item.yes_bid),
+        "direct_yes_bid": (
+            str(item.direct_yes_bid) if item.direct_yes_bid is not None else None
+        ),
+        "direct_yes_ask": (
+            str(item.direct_yes_ask) if item.direct_yes_ask is not None else None
+        ),
+        "effective_bid_route": item.effective_bid_route,
+        "effective_ask_route": item.effective_ask_route,
+        "complement_ticker": item.complement_ticker,
+        "action_route": item.action_route,
     }
 
 
@@ -369,6 +380,7 @@ def _print_scan(
                 "BID",
                 "ASK",
                 "SPREAD",
+                "SYNTH",
                 "ACTION",
                 "EDGE",
                 "BOOKS",
@@ -381,13 +393,26 @@ def _print_scan(
                     money(item.yes_bid),
                     money(item.yes_ask),
                     f"{(item.yes_ask - item.yes_bid) * 100:.2f}c",
+                    (
+                        "BOTH"
+                        if item.complement_ticker
+                        and ":NO" in str(item.effective_bid_route)
+                        and ":NO" in str(item.effective_ask_route)
+                        else "BID"
+                        if item.complement_ticker
+                        and ":NO" in str(item.effective_bid_route)
+                        else "ASK"
+                        if item.complement_ticker
+                        and ":NO" in str(item.effective_ask_route)
+                        else "-"
+                    ),
                     item.action,
                     f"{item.edge * 100:+.2f}c",
                     item.bookmaker_count,
                 )
                 for item in visible
             ),
-            right_align={2, 3, 4, 5, 7, 8},
+            right_align={2, 3, 4, 5, 8, 9},
         )
     )
 
@@ -541,19 +566,36 @@ def _print_live_preflight(payload: dict[str, object], *, json_output: bool) -> N
                 ("Recent contracts", number(payload["recent_contracts"])),
                 ("Queue ahead", number(payload["queue_ahead"])),
                 ("Latest public trade", payload["latest_trade_time"]),
-                ("Exchange expiration", "configured at submission"),
+                ("Independent start", payload["external_start_time"]),
+                ("Kalshi start", payload["market_occurrence_time"]),
+                ("Pregame cutoff uses", payload["effective_start_time"]),
+                ("Start offset", f"{payload['start_time_delta_seconds']} seconds"),
+                ("Exchange expiration", payload["order_expiration_time"]),
+                ("Maximum loss", money(payload["estimated_order_cost"])),
             ),
         )
     )
     print("\nExecution requires explicit production credentials and all live safety gates.")
 
 
-def _live_fair_probability(
+def _parse_live_time(value: str | None, *, argument: str) -> datetime:
+    if not value:
+        raise ValueError(f"{argument} is required")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"{argument} must be an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None:
+        raise ValueError(f"{argument} must include a timezone")
+    return parsed.astimezone(UTC)
+
+
+def _live_fair_snapshot(
     args: argparse.Namespace,
     client: KalshiClient,
     *,
     now: datetime | None = None,
-) -> Decimal:
+) -> OddsFairSnapshot:
     choices = sum((args.fair_probability is not None, args.odds_sport is not None))
     if choices != 1:
         raise ValueError("choose exactly one live fair source: --fair-probability or --odds-sport")
@@ -570,21 +612,25 @@ def _live_fair_probability(
             refresh_seconds=1,
             match_window_hours=args.odds_match_window_hours,
             include_live=False,
-        ).get(args.ticker)
+        ).snapshot(args.ticker)
 
-    if not args.fair_observed_at:
-        raise ValueError("manual --fair-probability requires --fair-observed-at")
-    try:
-        observed_at = datetime.fromisoformat(args.fair_observed_at.replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise ValueError("--fair-observed-at must be an ISO-8601 timestamp") from exc
-    if observed_at.tzinfo is None:
-        raise ValueError("--fair-observed-at must include a timezone")
-    age = ((now or datetime.now(UTC)) - observed_at.astimezone(UTC)).total_seconds()
+    observed_at = _parse_live_time(
+        args.fair_observed_at,
+        argument="--fair-observed-at",
+    )
+    external_start = _parse_live_time(
+        args.external_start_time,
+        argument="--external-start-time",
+    )
+    age = ((now or datetime.now(UTC)) - observed_at).total_seconds()
     if age < -5 or age > 60:
         raise ValueError("manual fair value must have been observed within the last 60 seconds")
     assert args.fair_probability is not None
-    return args.fair_probability
+    return OddsFairSnapshot(
+        probability=args.fair_probability,
+        event_commence_time=external_start,
+        observed_at=observed_at,
+    )
 
 
 def _production_client() -> KalshiClient:
@@ -605,12 +651,14 @@ def _cmd_live_order(args: argparse.Namespace) -> None:
     limits = LiveRiskLimits.from_env()
     if not args.execute_live:
         client = _client()
+        fair = _live_fair_snapshot(args, client)
         request = LiveOrderRequest(
             ticker=args.ticker,
             side=args.side,
             price=args.price_cents / Decimal("100"),
             count=args.count,
-            fair_probability=_live_fair_probability(args, client),
+            fair_probability=fair.probability,
+            external_start_time=fair.event_commence_time,
             expiration_seconds=args.expiration_seconds,
         )
         preview = preflight_live_order(
@@ -632,12 +680,14 @@ def _cmd_live_order(args: argparse.Namespace) -> None:
         raise ValueError("--execute-live requires a unique --intent-id")
     client = _production_client()
 
+    fair = _live_fair_snapshot(args, client)
     request = LiveOrderRequest(
         ticker=args.ticker,
         side=args.side,
         price=args.price_cents / Decimal("100"),
         count=args.count,
-        fair_probability=_live_fair_probability(args, client),
+        fair_probability=fair.probability,
+        external_start_time=fair.event_commence_time,
         expiration_seconds=args.expiration_seconds,
     )
 
@@ -961,6 +1011,10 @@ def build_parser() -> argparse.ArgumentParser:
     live_order.add_argument("--count", type=_decimal, default=Decimal("1"))
     live_order.add_argument("--fair-probability", type=_decimal)
     live_order.add_argument("--fair-observed-at")
+    live_order.add_argument(
+        "--external-start-time",
+        help="independent event start (required with a manual fair value)",
+    )
     live_order.add_argument("--odds-sport", help="Odds API sport key, e.g. soccer_usa_mls")
     live_order.add_argument("--odds-regions", default="us")
     live_order.add_argument("--odds-bookmakers", default=DEFAULT_SHARP_BOOKMAKERS)
