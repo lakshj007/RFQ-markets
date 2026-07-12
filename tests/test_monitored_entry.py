@@ -7,12 +7,16 @@ from types import SimpleNamespace
 from kalshi_mm.fair_value import OddsFairSnapshot, OddsFairValueUnavailable
 from kalshi_mm.live_order import (
     LIVE_ENABLE_TOKEN,
+    BoundedExitRequest,
+    FairAwareExitConfig,
     LiveAuditLog,
     LiveOrderRequest,
     LiveRiskLimits,
     MonitoredEntryConfig,
+    execute_fair_aware_bounded_exit,
     execute_monitored_live_order,
 )
+from kalshi_mm.models import OrderBook
 
 NOW = datetime(2026, 7, 12, 12, tzinfo=UTC)
 
@@ -44,6 +48,25 @@ class FillStream:
                 "type": "fill",
                 "msg": {"order_id": "order-1", "market_ticker": "MARKET", "count_fp": "1"},
             }
+        )
+
+
+class AdverseBookStream:
+    async def events(self, tickers):
+        ticker = tickers[0]
+        book = OrderBook.from_api(
+            {
+                "orderbook_fp": {
+                    "yes_dollars": [["0.5800", "10"]],
+                    "no_dollars": [["0.3300", "10"]],
+                }
+            }
+        )
+        yield SimpleNamespace(
+            message={"type": "orderbook_snapshot", "msg": {"market_ticker": ticker}},
+            state=SimpleNamespace(
+                orderbook=lambda requested: book if requested == ticker else None
+            ),
         )
 
 
@@ -294,6 +317,23 @@ def test_websocket_fill_triggers_immediate_cancel_and_rest_reconciliation(
     assert "monitored_final_reconciliation" in [item["event"] for item in records]
 
 
+def test_two_cent_kalshi_book_drop_cancels_resting_entry(monkeypatch, tmp_path) -> None:
+    client = MonitoredClient()
+    result, audit = run_monitor(
+        monkeypatch,
+        tmp_path,
+        client,
+        ScriptedFair(snapshot()),
+        stream=AdverseBookStream(),
+        monotonic=lambda: 0,
+    )
+
+    assert result["cancellation_reason"] == "kalshi_book_adverse_move"
+    assert client.cancelled == ["order-1"]
+    records = [json.loads(line) for line in audit.read_text().splitlines()]
+    assert "kalshi_adverse_move" in [item["event"] for item in records]
+
+
 def test_ctrl_c_path_cancels_and_reconciles(monkeypatch, tmp_path) -> None:
     client = MonitoredClient()
     result, _ = run_monitor(
@@ -322,3 +362,178 @@ def test_duplicate_intent_never_submits_or_reprices(monkeypatch, tmp_path) -> No
     assert result["result"] == "reconciled_existing"
     assert client.created == []
     assert client.cancelled == []
+
+
+class FairAwareExitClient(MonitoredClient):
+    def __init__(self, *, fallback_bid: str = "0.34") -> None:
+        super().__init__()
+        self.position = "1"
+        self.fallback_bid = fallback_bid
+
+    def get_orderbook(self, ticker: str, *, depth: int = 20) -> dict:
+        assert depth == 1
+        return {
+            "orderbook_fp": {
+                "yes_dollars": [[self.fallback_bid, "10"]],
+                "no_dollars": [["0.6300", "10"]],
+            }
+        }
+
+    def get_orders(self, **kwargs) -> list[dict]:
+        if kwargs.get("status") == "resting" and (not self.created or self.status != "resting"):
+            return []
+        if not self.created:
+            return []
+        return [{"order_id": "target-1", "status": self.status}]
+
+    def create_order(self, **kwargs) -> dict:
+        self.created.append(kwargs)
+        if kwargs["time_in_force"] == "immediate_or_cancel":
+            self.position = "0"
+            return {"order_id": "fallback-1", "remaining_count": "0"}
+        return {"order_id": "target-1", "remaining_count": "1"}
+
+    def cancel_order(self, order_id: str, *, subaccount: int = 0) -> dict:
+        self.cancelled.append(order_id)
+        self.status = "canceled"
+        return {"order_id": order_id, "reduced_by": "1"}
+
+
+def exit_request() -> BoundedExitRequest:
+    return BoundedExitRequest(
+        ticker="MARKET",
+        target_price=Decimal("0.36"),
+        floor_price=Decimal("0.33"),
+        count=Decimal("1"),
+        external_start_time=NOW + timedelta(hours=1),
+        target_wait_seconds=60,
+    )
+
+
+def run_fair_aware_exit(monkeypatch, tmp_path, client, source, clock, stream=None):
+    monkeypatch.setenv("KALSHI_LIVE_TRADING_ENABLED", LIVE_ENABLE_TOKEN)
+    return asyncio.run(
+        execute_fair_aware_bounded_exit(
+            client,
+            exit_request(),
+            fair_source=source,
+            initial_snapshot=snapshot("0.36"),
+            stream=stream or QuietStream(),  # type: ignore[arg-type]
+            config=FairAwareExitConfig(
+                fair_poll_seconds=0.01,
+                rest_reconcile_seconds=0.01,
+                failure_grace_seconds=0.01,
+                adverse_move=Decimal("0.02"),
+            ),
+            intent_id="test-intent-001",
+            audit_log=LiveAuditLog(tmp_path / "exit-audit.jsonl"),
+            now=NOW,
+            monotonic=clock,
+        )
+    )
+
+
+def test_stable_fair_holds_target_until_cutoff_without_timed_markdown(
+    monkeypatch, tmp_path
+) -> None:
+    client = FairAwareExitClient()
+    result = run_fair_aware_exit(
+        monkeypatch,
+        tmp_path,
+        client,
+        ScriptedFair(snapshot("0.36")),
+        AdvancingClock(step=1000),
+    )
+
+    assert result["result"] == "held_without_adverse_signal"
+    assert result["reason"] == "pregame_cutoff_hold"
+    assert len(client.created) == 1
+    assert client.created[0]["price"] == "0.3600"
+    assert client.created[0]["expiration_time"] == int((NOW + timedelta(minutes=55)).timestamp())
+
+
+def test_two_cent_fair_drop_triggers_one_floor_bounded_fallback(
+    monkeypatch, tmp_path
+) -> None:
+    client = FairAwareExitClient(fallback_bid="0.34")
+    result = run_fair_aware_exit(
+        monkeypatch,
+        tmp_path,
+        client,
+        ScriptedFair(snapshot("0.33")),
+        AdvancingClock(),
+    )
+
+    assert result["result"] == "adverse_move_fallback_submitted"
+    assert result["reason"] == "sportsbook_fair_adverse_move"
+    assert client.cancelled == ["target-1"]
+    assert len(client.created) == 2
+    assert client.created[1]["price"] == "0.3400"
+    assert client.created[1]["reduce_only"] is True
+    assert client.created[1]["time_in_force"] == "immediate_or_cancel"
+
+
+def test_adverse_fair_drop_holds_when_bid_is_below_floor(monkeypatch, tmp_path) -> None:
+    client = FairAwareExitClient(fallback_bid="0.32")
+    result = run_fair_aware_exit(
+        monkeypatch,
+        tmp_path,
+        client,
+        ScriptedFair(snapshot("0.33")),
+        AdvancingClock(),
+    )
+
+    assert result["result"] == "held_below_floor"
+    assert len(client.created) == 1
+    assert client.position == "1"
+
+
+class ChangingExitClient(FairAwareExitClient):
+    def __init__(self) -> None:
+        super().__init__(fallback_bid="0.33")
+        self.book_calls = 0
+
+    def get_orderbook(self, ticker: str, *, depth: int = 20) -> dict:
+        self.book_calls += 1
+        bid = "0.35" if self.book_calls == 1 else "0.33"
+        return {
+            "orderbook_fp": {
+                "yes_dollars": [[bid, "10"]],
+                "no_dollars": [["0.6300", "10"]],
+            }
+        }
+
+
+class ExitBookDropStream:
+    async def events(self, tickers):
+        ticker = tickers[0]
+        book = OrderBook.from_api(
+            {
+                "orderbook_fp": {
+                    "yes_dollars": [["0.3300", "10"]],
+                    "no_dollars": [["0.6300", "10"]],
+                }
+            }
+        )
+        yield SimpleNamespace(
+            message={"type": "orderbook_snapshot", "msg": {"market_ticker": ticker}},
+            state=SimpleNamespace(
+                orderbook=lambda requested: book if requested == ticker else None
+            ),
+        )
+
+
+def test_two_cent_kalshi_drop_triggers_one_exit_fallback(monkeypatch, tmp_path) -> None:
+    client = ChangingExitClient()
+    result = run_fair_aware_exit(
+        monkeypatch,
+        tmp_path,
+        client,
+        ScriptedFair(snapshot("0.36")),
+        lambda: 0,
+        stream=ExitBookDropStream(),
+    )
+
+    assert result["result"] == "adverse_move_fallback_submitted"
+    assert result["reason"] == "kalshi_book_adverse_move"
+    assert client.created[1]["price"] == "0.3300"

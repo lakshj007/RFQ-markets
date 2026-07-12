@@ -28,11 +28,13 @@ from .live_order import (
     LIVE_ACKNOWLEDGEMENT,
     MONITORED_ENTRY_ACKNOWLEDGEMENT,
     BoundedExitRequest,
+    FairAwareExitConfig,
     LiveAuditLog,
     LiveOrderRequest,
     LiveRiskLimits,
     MonitoredEntryConfig,
     execute_bounded_exit,
+    execute_fair_aware_bounded_exit,
     execute_live_order,
     execute_monitored_live_order,
     preflight_live_order,
@@ -595,6 +597,7 @@ def _print_live_preflight(payload: dict[str, object], *, json_output: bool) -> N
                     ("Maximum resting", f"{monitor['max_rest_seconds']} seconds"),
                     ("Maximum odds age", f"{monitor['max_odds_age_seconds']} seconds"),
                     ("API failure grace", f"{monitor['failure_grace_seconds']} seconds"),
+                    ("Adverse Kalshi move", money(monitor["adverse_move"])),
                     ("Order handling", "cancel only; never amend or replace"),
                 ),
             )
@@ -606,9 +609,10 @@ def _print_live_preflight(payload: dict[str, object], *, json_output: bool) -> N
                 ("FIELD", "VALUE"),
                 (
                     ("Target ask", money(auto_exit["target_price"])),
-                    ("Target wait", f"{auto_exit['target_wait_seconds']} seconds"),
+                    ("Target wait", "until fill, adverse move, or pregame cutoff"),
                     ("Hard floor", money(auto_exit["floor_price"])),
-                    ("Fallback", "one reduce-only IOC at best bid, floor enforced"),
+                    ("Adverse trigger", money(auto_exit.get("adverse_move"))),
+                    ("Fallback", "one reduce-only IOC only after adverse move"),
                 ),
             )
         )
@@ -653,6 +657,7 @@ def _monitor_config(args: argparse.Namespace) -> MonitoredEntryConfig:
         max_odds_age_seconds=min(args.odds_max_age, 60),
         failure_grace_seconds=args.monitor_failure_grace_seconds,
         rest_reconcile_seconds=args.monitor_reconcile_seconds,
+        adverse_move=args.adverse_move_cents / Decimal("100"),
     )
     config.validate()
     if config.poll_interval_seconds < 25:
@@ -777,6 +782,8 @@ def _cmd_live_order(args: argparse.Namespace) -> None:
                 "target_price": str(bounded_exit.target_price),
                 "floor_price": str(bounded_exit.floor_price),
                 "target_wait_seconds": bounded_exit.target_wait_seconds,
+                "mode": "fair_and_kalshi_adverse_move",
+                "adverse_move": str(args.adverse_move_cents / Decimal("100")),
             }
         if args.monitor_entry:
             config = _monitor_config(args)
@@ -786,6 +793,7 @@ def _cmd_live_order(args: argparse.Namespace) -> None:
                 "max_rest_seconds": config.max_rest_seconds,
                 "max_odds_age_seconds": config.max_odds_age_seconds,
                 "failure_grace_seconds": config.failure_grace_seconds,
+                "adverse_move": str(config.adverse_move),
             }
         _print_live_preflight(payload, json_output=args.json)
         return
@@ -862,17 +870,35 @@ def _cmd_live_order(args: argparse.Namespace) -> None:
         )
     if bounded_exit is not None:
         position = as_decimal(client.get_position(args.ticker, subaccount=0))
-        result["auto_exit"] = (
-            execute_bounded_exit(
+        if position <= Decimal("0"):
+            result["auto_exit"] = {"result": "not_needed_no_position"}
+        elif odds_source is not None:
+            exit_fair = odds_source.refresh_snapshot(args.ticker)
+            result["auto_exit"] = asyncio.run(
+                execute_fair_aware_bounded_exit(
+                    client,
+                    bounded_exit,
+                    fair_source=odds_source,
+                    initial_snapshot=exit_fair,
+                    stream=KalshiWebSocket(client),
+                    config=FairAwareExitConfig(
+                        fair_poll_seconds=args.monitor_poll_seconds,
+                        rest_reconcile_seconds=args.monitor_reconcile_seconds,
+                        failure_grace_seconds=args.monitor_failure_grace_seconds,
+                        adverse_move=args.adverse_move_cents / Decimal("100"),
+                    ),
+                    intent_id=args.intent_id,
+                    audit_log=LiveAuditLog(args.audit_log),
+                )
+            )
+        else:
+            result["auto_exit"] = execute_bounded_exit(
                 client,
                 bounded_exit,
                 intent_id=args.intent_id,
                 audit_log=LiveAuditLog(args.audit_log),
                 poll_seconds=args.poll_seconds,
             )
-            if position > Decimal("0")
-            else {"result": "not_needed_no_position"}
-        )
     if args.json:
         print(json.dumps(result))
     else:
@@ -1202,7 +1228,7 @@ def build_parser() -> argparse.ArgumentParser:
     live_order.add_argument("--odds-min-bookmakers", type=int, default=2)
     live_order.add_argument("--odds-max-age", type=float, default=180)
     live_order.add_argument("--odds-match-window-hours", type=float, default=6)
-    live_order.add_argument("--expiration-seconds", type=int, default=120)
+    live_order.add_argument("--expiration-seconds", type=int, default=300)
     live_order.add_argument("--wait-seconds", type=int, default=60)
     live_order.add_argument("--poll-seconds", type=float, default=2)
     live_order.add_argument(
@@ -1213,9 +1239,20 @@ def build_parser() -> argparse.ArgumentParser:
     live_order.add_argument("--monitor-poll-seconds", type=float, default=30)
     live_order.add_argument("--monitor-failure-grace-seconds", type=float, default=15)
     live_order.add_argument("--monitor-reconcile-seconds", type=float, default=10)
+    live_order.add_argument(
+        "--adverse-move-cents",
+        type=_decimal,
+        default=Decimal("2"),
+        help="fair or Kalshi move that triggers a defensive cancel/exit",
+    )
     live_order.add_argument("--auto-exit-target-cents", type=_decimal)
     live_order.add_argument("--auto-exit-floor-cents", type=_decimal)
-    live_order.add_argument("--auto-exit-wait-seconds", type=int, default=60)
+    live_order.add_argument(
+        "--auto-exit-wait-seconds",
+        type=int,
+        default=60,
+        help="legacy manual-fair exit timeout; sportsbook-monitored exits are fair-aware",
+    )
     live_order.add_argument("--acknowledge-auto-exit")
     live_order.add_argument("--acknowledge-monitored-entry")
     live_order.add_argument("--audit-log", type=Path, default=Path("logs/live-orders.jsonl"))

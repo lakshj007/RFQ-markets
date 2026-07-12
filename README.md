@@ -181,8 +181,9 @@ The sample uses `post_only=true`, `cancel_order_on_pause=true`, `taker_at_cross`
 
 `live-order` means a real-money production order. It does not permit in-play trading,
 continuous repricing, or automated two-sided production market making. Entries and
-normal exits are post-only. An optional bounded exit may make one reduce-only IOC sale
-after its target ask times out, but only at or above an explicitly confirmed floor.
+normal exits are post-only. An optional fair-aware bounded exit may make one reduce-only
+IOC sale after a material adverse fair or Kalshi-book move, but only at or above an
+explicitly confirmed floor.
 The hard-coded ceiling is one contract, at most $1 of entry cost, and at most one
 contract of absolute position.
 
@@ -210,7 +211,7 @@ kalshi-mm live-order \
   --side bid \
   --price-cents 16 \
   --odds-sport soccer_usa_mls \
-  --expiration-seconds 120
+  --expiration-seconds 300
 ```
 
 The preview and execution both reject the order unless the market is active and at
@@ -242,7 +243,7 @@ kalshi-mm live-order \
   --side bid \
   --price-cents 16 \
   --odds-sport soccer_usa_mls \
-  --expiration-seconds 120 \
+  --expiration-seconds 300 \
   --wait-seconds 60 \
   --execute-live \
   --acknowledge-risk REAL_MONEY_ONE_CONTRACT \
@@ -274,20 +275,22 @@ kalshi-mm live-order \
   --side bid \
   --price-cents 60 \
   --odds-sport basketball_nba \
-  --expiration-seconds 120 \
+  --expiration-seconds 300 \
   --monitor-entry
 ```
 
 Live execution additionally requires the exact acknowledgement
 `--acknowledge-monitored-entry MONITOR_ODDS_AND_CANCEL_ENTRY` along with every normal
-live-order gate. The default sportsbook poll interval is 30 seconds and production
+live-order gate. Monitored entries default to the hard 300-second maximum. The default
+sportsbook poll interval is 30 seconds and production
 polling cannot be configured below 25 seconds. The initial league response is used to
 safely match one event; later polls use The Odds API's single-event endpoint. Each
 refresh requires at least two timestamped, fresh bookmakers and recomputes the same
 no-vig consensus. The order is canceled when fair falls below the threshold, too few
 books remain, odds become stale, the quota is exhausted, the API failure grace expires,
-the independent start is within five minutes, the maximum rest expires, or the process
-is interrupted.
+the Kalshi bid or ask falls by the configured adverse-move threshold (two cents by
+default), the independent start is within five minutes, the maximum rest expires, or
+the process is interrupted.
 
 Kalshi's authenticated WebSocket supplies real-time order, fill, position, and book
 updates. Authenticated REST reconciliation runs alongside it and always runs after a
@@ -302,12 +305,16 @@ upstream latency. Kalshi book moves arrive faster, but are not an independent fa
 source by themselves. Cancellation also cannot prevent a match that was already in
 flight when the cancel reached the exchange.
 
-An entry may include a preauthorized bounded exit. This posts one reduce-only target
-ask after an entry fill. If the target does not fill during the configured wait, the
-target is canceled and the current book is refreshed. The program then makes at most
-one reduce-only immediate-or-cancel sale at the best bid, provided that bid is at or
-above the hard floor. Otherwise it reports `held_below_floor` and leaves the position
-untouched. It never continuously reprices and cannot create a short position:
+An entry may include a preauthorized fair-aware bounded exit. After a confirmed fill,
+it records the sportsbook fair and Kalshi best bid, then posts one reduce-only target
+ask. The target is not marked down merely because time passes or volume is low. While
+it rests, sportsbook fair is refreshed every 30 seconds and the Kalshi book is watched
+over WebSocket. A drop of at least `--adverse-move-cents` from either baseline cancels
+the target and permits at most one reduce-only immediate-or-cancel sale at the refreshed
+best bid, provided that bid is at or above the hard floor. Below the floor it reports
+`held_below_floor` and holds the position. Without an adverse signal it holds through
+the pregame cutoff rather than forcing a sale. It never continuously reprices and
+cannot create a short position:
 
 ```bash
 kalshi-mm live-order \
@@ -317,7 +324,7 @@ kalshi-mm live-order \
   --odds-sport basketball_nba_summer_league \
   --auto-exit-target-cents 64 \
   --auto-exit-floor-cents 55 \
-  --auto-exit-wait-seconds 60
+  --adverse-move-cents 2
 ```
 
 Real execution additionally requires

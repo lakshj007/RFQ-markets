@@ -225,6 +225,7 @@ class MonitoredEntryConfig:
     max_odds_age_seconds: float = 60
     failure_grace_seconds: float = 15
     rest_reconcile_seconds: float = 10
+    adverse_move: Decimal = HARD_MIN_EDGE
 
     def validate(self) -> None:
         if not 0.01 <= self.poll_interval_seconds <= 60:
@@ -237,6 +238,26 @@ class MonitoredEntryConfig:
             raise ValueError("monitored failure grace must be between 0.01 and 60 seconds")
         if not 0.01 <= self.rest_reconcile_seconds <= 30:
             raise ValueError("REST reconciliation must be between 0.01 and 30 seconds")
+        if not HARD_MIN_EDGE <= self.adverse_move <= Decimal("0.10"):
+            raise ValueError("adverse Kalshi move must be between $0.02 and $0.10")
+
+
+@dataclass(frozen=True, slots=True)
+class FairAwareExitConfig:
+    fair_poll_seconds: float = 30
+    rest_reconcile_seconds: float = 10
+    failure_grace_seconds: float = 15
+    adverse_move: Decimal = HARD_MIN_EDGE
+
+    def validate(self) -> None:
+        if not 0.01 <= self.fair_poll_seconds <= 60:
+            raise ValueError("exit fair polling must be between 0.01 and 60 seconds")
+        if not 0.01 <= self.rest_reconcile_seconds <= 30:
+            raise ValueError("exit REST reconciliation must be between 0.01 and 30 seconds")
+        if not 0.01 <= self.failure_grace_seconds <= 60:
+            raise ValueError("exit failure grace must be between 0.01 and 60 seconds")
+        if not HARD_MIN_EDGE <= self.adverse_move <= Decimal("0.10"):
+            raise ValueError("exit adverse move must be between $0.02 and $0.10")
 
 
 @dataclass(frozen=True, slots=True)
@@ -873,6 +894,7 @@ async def execute_monitored_live_order(
             "max_rest_seconds": config.max_rest_seconds,
             "max_odds_age_seconds": config.max_odds_age_seconds,
             "failure_grace_seconds": config.failure_grace_seconds,
+            "adverse_move": str(config.adverse_move),
         },
     )
     audit_log.append("fair_snapshot", _fair_snapshot_payload(initial_snapshot))
@@ -958,6 +980,36 @@ async def execute_monitored_live_order(
                     ticker = payload.get("market_ticker") or payload.get("ticker")
                     if ticker == request.ticker:
                         audit_log.append("websocket_position", {"position": payload})
+                if message_type in {"orderbook_snapshot", "orderbook_delta"}:
+                    book = update.state.orderbook(request.ticker)
+                    if book is not None:
+                        adverse_bid = (
+                            book.best_bid is not None
+                            and book.best_bid.price
+                            <= preflight.best_bid - config.adverse_move
+                        )
+                        adverse_ask = (
+                            book.best_ask is not None
+                            and book.best_ask.price
+                            <= preflight.best_ask - config.adverse_move
+                        )
+                        if adverse_bid or adverse_ask:
+                            cancellation_reason = "kalshi_book_adverse_move"
+                            audit_log.append(
+                                "kalshi_adverse_move",
+                                {
+                                    "initial_best_bid": str(preflight.best_bid),
+                                    "initial_best_ask": str(preflight.best_ask),
+                                    "current_best_bid": (
+                                        str(book.best_bid.price) if book.best_bid else None
+                                    ),
+                                    "current_best_ask": (
+                                        str(book.best_ask.price) if book.best_ask else None
+                                    ),
+                                    "threshold": str(config.adverse_move),
+                                },
+                            )
+                            break
 
             current_time = monotonic()
             if current_time >= next_reconcile:
@@ -1135,6 +1187,291 @@ async def execute_monitored_live_order(
         "final_position": str(final_position),
         "fee": str(fee),
     }
+
+
+async def execute_fair_aware_bounded_exit(
+    client: LiveOrderClient,
+    request: BoundedExitRequest,
+    *,
+    fair_source: MonitoredFairSource,
+    initial_snapshot: OddsFairSnapshot,
+    stream: KalshiWebSocket,
+    config: FairAwareExitConfig,
+    intent_id: str,
+    audit_log: LiveAuditLog,
+    now: datetime | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> dict[str, object]:
+    """Keep the target resting; fall back only after a material adverse move."""
+    if os.getenv("KALSHI_LIVE_TRADING_ENABLED") != LIVE_ENABLE_TOKEN:
+        raise ValueError(
+            f"set KALSHI_LIVE_TRADING_ENABLED={LIVE_ENABLE_TOKEN} to enable real orders"
+        )
+    config.validate()
+    live_client_order_id(intent_id)
+    effective_now = now or datetime.now(UTC)
+    preflight = preflight_bounded_exit(client, request, now=effective_now)
+    cutoff = preflight.effective_start_time - timedelta(minutes=5)
+    if cutoff <= effective_now:
+        raise ValueError("fair-aware exit monitoring stops five minutes before start")
+    audit_log.append(
+        "fair_aware_exit_validated",
+        {
+            "preflight": preflight.as_dict(),
+            "initial_fair": str(initial_snapshot.probability),
+            "initial_best_bid": str(preflight.best_bid),
+            "adverse_move": str(config.adverse_move),
+            "fair_poll_seconds": config.fair_poll_seconds,
+            "monitor_until": cutoff.isoformat(),
+        },
+    )
+
+    target_response = client.create_order(
+        ticker=request.ticker,
+        client_order_id=f"manual-exit-target-{intent_id}",
+        side="ask",
+        count=format(request.count, "f"),
+        price=format_fixed_price(request.target_price),
+        expiration_time=int(cutoff.timestamp()),
+        reduce_only=True,
+        subaccount=request.subaccount,
+        post_only=True,
+        cancel_order_on_pause=True,
+        time_in_force="good_till_canceled",
+    )
+    target_order_id = str(target_response["order_id"])
+    audit_log.append(
+        "fair_aware_target_submitted",
+        {"order_id": target_order_id, "response": target_response},
+    )
+    if as_decimal(target_response.get("remaining_count", request.count)) <= ZERO:
+        result = {"result": "target_filled", "target_order_id": target_order_id}
+        audit_log.append("fair_aware_exit_terminal", result)
+        return result
+
+    queue: asyncio.Queue[StreamUpdate] = asyncio.Queue(maxsize=4096)
+
+    async def pump_stream() -> None:
+        try:
+            async for update in stream.events([request.ticker]):
+                await queue.put(update)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            audit_log.append(
+                "exit_websocket_failed",
+                {"error_type": type(exc).__name__, "error": str(exc)},
+            )
+
+    stream_task = asyncio.create_task(pump_stream())
+    started = monotonic()
+    next_fair = started + config.fair_poll_seconds
+    next_reconcile = started + config.rest_reconcile_seconds
+    failure_started: float | None = None
+    trigger: str | None = None
+    target_terminal = False
+    try:
+        while True:
+            current_time = monotonic()
+            wall_now = (
+                effective_now + timedelta(seconds=current_time - started)
+                if now is not None
+                else datetime.now(UTC)
+            )
+            if wall_now >= cutoff:
+                trigger = "pregame_cutoff_hold"
+                break
+            timeout = max(
+                0.0,
+                min(
+                    next_fair,
+                    next_reconcile,
+                    started + (cutoff - effective_now).total_seconds(),
+                )
+                - current_time,
+            )
+            update: StreamUpdate | None = None
+            with contextlib.suppress(TimeoutError):
+                update = await asyncio.wait_for(queue.get(), timeout=timeout)
+            if update is not None:
+                message_type = update.message.get("type")
+                payload = update.message.get("msg", {})
+                if str(payload.get("order_id", "")) == target_order_id:
+                    audit_log.append(
+                        "fair_aware_exit_websocket_order",
+                        {"type": message_type, "payload": payload},
+                    )
+                    if message_type == "fill" or (
+                        message_type == "user_order" and payload.get("status") != "resting"
+                    ):
+                        target_terminal = True
+                        break
+                if message_type in {"orderbook_snapshot", "orderbook_delta"}:
+                    book = update.state.orderbook(request.ticker)
+                    if (
+                        book is not None
+                        and book.best_bid is not None
+                        and book.best_bid.price <= preflight.best_bid - config.adverse_move
+                    ):
+                        trigger = "kalshi_book_adverse_move"
+                        audit_log.append(
+                            "fair_aware_exit_trigger",
+                            {
+                                "reason": trigger,
+                                "initial_best_bid": str(preflight.best_bid),
+                                "current_best_bid": str(book.best_bid.price),
+                            },
+                        )
+                        break
+
+            current_time = monotonic()
+            if current_time >= next_reconcile:
+                orders = client.get_orders(
+                    ticker=request.ticker,
+                    subaccount=request.subaccount,
+                    limit=1000,
+                )
+                current = next(
+                    (item for item in orders if item.get("order_id") == target_order_id), None
+                )
+                if current is not None and current.get("status") != "resting":
+                    target_terminal = True
+                    break
+                next_reconcile = current_time + config.rest_reconcile_seconds
+
+            if current_time >= next_fair:
+                try:
+                    snapshot = fair_source.refresh_snapshot(request.ticker)
+                except Exception as exc:
+                    if failure_started is None:
+                        failure_started = current_time
+                    elapsed = current_time - failure_started
+                    audit_log.append(
+                        "fair_aware_exit_refresh_failed",
+                        {"error": str(exc), "failure_elapsed_seconds": elapsed},
+                    )
+                    if elapsed >= config.failure_grace_seconds:
+                        trigger = "fair_unavailable_hold"
+                        break
+                    next_fair = current_time + min(
+                        5.0, config.failure_grace_seconds - elapsed
+                    )
+                else:
+                    failure_started = None
+                    audit_log.append(
+                        "fair_aware_exit_snapshot", _fair_snapshot_payload(snapshot)
+                    )
+                    if (
+                        snapshot.probability
+                        <= initial_snapshot.probability - config.adverse_move
+                    ):
+                        trigger = "sportsbook_fair_adverse_move"
+                        audit_log.append(
+                            "fair_aware_exit_trigger",
+                            {
+                                "reason": trigger,
+                                "initial_fair": str(initial_snapshot.probability),
+                                "current_fair": str(snapshot.probability),
+                            },
+                        )
+                        break
+                    next_fair = current_time + config.fair_poll_seconds
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        trigger = "interrupted_hold"
+    finally:
+        stream_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await stream_task
+
+    remaining_position = as_decimal(
+        client.get_position(request.ticker, subaccount=request.subaccount)
+    )
+    if target_terminal and remaining_position <= ZERO:
+        result = {"result": "target_filled", "target_order_id": target_order_id}
+        audit_log.append("fair_aware_exit_terminal", result)
+        return result
+
+    cancellation: dict[str, Any] | None = None
+    try:
+        cancellation = client.cancel_order(target_order_id, subaccount=request.subaccount)
+    except KalshiAPIError as exc:
+        if exc.status_code != 404:
+            raise
+    audit_log.append(
+        "fair_aware_target_cancelled",
+        {"order_id": target_order_id, "reason": trigger, "response": cancellation},
+    )
+    remaining_position = as_decimal(
+        client.get_position(request.ticker, subaccount=request.subaccount)
+    )
+    if remaining_position <= ZERO:
+        result = {"result": "target_filled_during_cancel", "target_order_id": target_order_id}
+        audit_log.append("fair_aware_exit_terminal", result)
+        return result
+    if trigger not in {"kalshi_book_adverse_move", "sportsbook_fair_adverse_move"}:
+        result = {
+            "result": "held_without_adverse_signal",
+            "reason": trigger,
+            "remaining_position": str(remaining_position),
+        }
+        audit_log.append("fair_aware_exit_terminal", result)
+        return result
+
+    fallback_request = BoundedExitRequest(
+        ticker=request.ticker,
+        target_price=request.target_price,
+        floor_price=request.floor_price,
+        count=min(remaining_position, request.count),
+        external_start_time=request.external_start_time,
+        target_wait_seconds=request.target_wait_seconds,
+        subaccount=request.subaccount,
+    )
+    fallback = preflight_bounded_exit(
+        client,
+        fallback_request,
+        now=effective_now if now is not None else None,
+        require_target_post_only=False,
+    )
+    if fallback.fallback_price is None:
+        result = {
+            "result": "held_below_floor",
+            "reason": trigger,
+            "best_bid": str(fallback.best_bid),
+            "floor_price": str(request.floor_price),
+            "remaining_position": str(remaining_position),
+        }
+        audit_log.append("fair_aware_exit_terminal", result)
+        return result
+    fallback_response = client.create_order(
+        ticker=request.ticker,
+        client_order_id=f"manual-exit-fallback-{intent_id}",
+        side="ask",
+        count=format(fallback_request.count, "f"),
+        price=format_fixed_price(fallback.fallback_price),
+        expiration_time=None,
+        reduce_only=True,
+        subaccount=request.subaccount,
+        post_only=False,
+        cancel_order_on_pause=True,
+        time_in_force="immediate_or_cancel",
+    )
+    final_position = as_decimal(
+        client.get_position(request.ticker, subaccount=request.subaccount)
+    )
+    result = {
+        "result": "adverse_move_fallback_submitted",
+        "reason": trigger,
+        "fallback_price": str(fallback.fallback_price),
+        "estimated_fee": (
+            str(fallback.estimated_fallback_fee)
+            if fallback.estimated_fallback_fee is not None
+            else None
+        ),
+        "response": fallback_response,
+        "remaining_position": str(final_position),
+    }
+    audit_log.append("fair_aware_exit_terminal", result)
+    return result
 
 
 def execute_bounded_exit(
