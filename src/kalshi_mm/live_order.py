@@ -570,6 +570,10 @@ def live_client_order_id(intent_id: str) -> str:
     return f"manual-live-{intent_id}"
 
 
+def format_fixed_price(price: Decimal) -> str:
+    return format(price, ".4f")
+
+
 def execute_live_order(
     client: LiveOrderClient,
     request: LiveOrderRequest,
@@ -621,7 +625,7 @@ def execute_live_order(
             client_order_id=client_order_id,
             side=request.side,
             count=format(request.count, "f"),
-            price=format(request.price, "f"),
+            price=format_fixed_price(request.price),
             expiration_time=expiration_time,
             reduce_only=request.side == "ask",
             subaccount=request.subaccount,
@@ -758,7 +762,7 @@ def execute_bounded_exit(
         client_order_id=target_client_id,
         side="ask",
         count=format(request.count, "f"),
-        price=format(request.target_price, "f"),
+        price=format_fixed_price(request.target_price),
         expiration_time=int(effective_now.timestamp()) + request.target_wait_seconds + 30,
         reduce_only=True,
         subaccount=request.subaccount,
@@ -855,7 +859,7 @@ def execute_bounded_exit(
         client_order_id=fallback_client_id,
         side="ask",
         count=format(fallback_request.count, "f"),
-        price=format(fallback.fallback_price, "f"),
+        price=format_fixed_price(fallback.fallback_price),
         expiration_time=None,
         reduce_only=True,
         subaccount=request.subaccount,

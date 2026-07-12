@@ -12,6 +12,7 @@ from kalshi_mm.live_order import (
     LiveRiskLimits,
     execute_bounded_exit,
     execute_live_order,
+    format_fixed_price,
     preflight_bounded_exit,
     preflight_live_order,
 )
@@ -119,6 +120,11 @@ def request() -> LiveOrderRequest:
         external_start_time=datetime(2026, 7, 11, 3, tzinfo=UTC),
         expiration_seconds=120,
     )
+
+
+def test_fixed_price_preserves_required_trailing_precision() -> None:
+    assert format_fixed_price(Decimal("0.60")) == "0.6000"
+    assert format_fixed_price(Decimal("0.16")) == "0.1600"
 
 
 def test_public_preflight_requires_recent_flow_and_edge() -> None:
@@ -380,7 +386,7 @@ def test_bounded_exit_cancels_target_then_uses_reduce_only_ioc(monkeypatch, tmp_
     assert len(client.created) == 2
     fallback = client.created[1]
     assert fallback["side"] == "ask"
-    assert fallback["price"] == "0.16"
+    assert fallback["price"] == "0.1600"
     assert fallback["reduce_only"] is True
     assert fallback["post_only"] is False
     assert fallback["time_in_force"] == "immediate_or_cancel"
