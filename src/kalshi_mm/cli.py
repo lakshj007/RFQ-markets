@@ -1228,7 +1228,7 @@ def build_parser() -> argparse.ArgumentParser:
     live_order.add_argument("--odds-min-bookmakers", type=int, default=2)
     live_order.add_argument("--odds-max-age", type=float, default=180)
     live_order.add_argument("--odds-match-window-hours", type=float, default=6)
-    live_order.add_argument("--expiration-seconds", type=int, default=300)
+    live_order.add_argument("--expiration-seconds", type=int, default=600)
     live_order.add_argument("--wait-seconds", type=int, default=60)
     live_order.add_argument("--poll-seconds", type=float, default=2)
     live_order.add_argument(

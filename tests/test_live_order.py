@@ -150,6 +150,29 @@ def test_public_preflight_requires_recent_flow_and_edge() -> None:
     assert result.available_balance is None
 
 
+def test_preflight_allows_ten_minute_guarded_expiration() -> None:
+    now = datetime(2026, 7, 11, 2, tzinfo=UTC)
+    ten_minute_request = LiveOrderRequest(
+        ticker="MARKET",
+        side="bid",
+        price=Decimal("0.16"),
+        count=Decimal("1"),
+        fair_probability=Decimal("0.19"),
+        external_start_time=now + timedelta(hours=1),
+        expiration_seconds=600,
+    )
+
+    result = preflight_live_order(
+        FakeLiveClient(now),
+        ten_minute_request,
+        LiveRiskLimits(max_expiration_seconds=600),
+        authenticated=False,
+        now=now,
+    )
+
+    assert result.order_expiration_time == now + timedelta(minutes=10)
+
+
 def test_preflight_rejects_crossing_and_insufficient_edge() -> None:
     now = datetime(2026, 7, 11, 2, tzinfo=UTC)
     client = FakeLiveClient(now)

@@ -211,7 +211,7 @@ kalshi-mm live-order \
   --side bid \
   --price-cents 16 \
   --odds-sport soccer_usa_mls \
-  --expiration-seconds 300
+  --expiration-seconds 600
 ```
 
 The preview and execution both reject the order unless the market is active and at
@@ -243,7 +243,7 @@ kalshi-mm live-order \
   --side bid \
   --price-cents 16 \
   --odds-sport soccer_usa_mls \
-  --expiration-seconds 300 \
+  --expiration-seconds 600 \
   --wait-seconds 60 \
   --execute-live \
   --acknowledge-risk REAL_MONEY_ONE_CONTRACT \
@@ -275,13 +275,13 @@ kalshi-mm live-order \
   --side bid \
   --price-cents 60 \
   --odds-sport basketball_nba \
-  --expiration-seconds 300 \
+  --expiration-seconds 600 \
   --monitor-entry
 ```
 
 Live execution additionally requires the exact acknowledgement
 `--acknowledge-monitored-entry MONITOR_ODDS_AND_CANCEL_ENTRY` along with every normal
-live-order gate. Monitored entries default to the hard 300-second maximum. The default
+live-order gate. Monitored entries default to the hard 600-second maximum. The default
 sportsbook poll interval is 30 seconds and production
 polling cannot be configured below 25 seconds. The initial league response is used to
 safely match one event; later polls use The Odds API's single-event endpoint. Each

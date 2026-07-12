@@ -28,7 +28,7 @@ HARD_MIN_EDGE = Decimal("0.02")
 HARD_MAX_SPREAD = Decimal("0.15")
 HARD_MAX_QUEUE_AHEAD = Decimal("500")
 HARD_MAX_TRADE_AGE_SECONDS = 900
-HARD_MAX_EXPIRATION_SECONDS = 300
+HARD_MAX_EXPIRATION_SECONDS = 600
 MAKER_FEE_RATE = Decimal("0.0175")
 TAKER_FEE_RATE = Decimal("0.07")
 INTENT_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{7,39}$")
@@ -164,7 +164,7 @@ class LiveRiskLimits:
         if self.min_recent_contracts <= ZERO:
             raise ValueError("live minimum recent contracts must be positive")
         if not 10 <= self.max_expiration_seconds <= HARD_MAX_EXPIRATION_SECONDS:
-            raise ValueError("live max expiration must be between 10 and 300 seconds")
+            raise ValueError("live max expiration must be between 10 and 600 seconds")
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,7 +231,7 @@ class MonitoredEntryConfig:
         if not 0.01 <= self.poll_interval_seconds <= 60:
             raise ValueError("monitored fair polling must be between 0.01 and 60 seconds")
         if not 10 <= self.max_rest_seconds <= HARD_MAX_EXPIRATION_SECONDS:
-            raise ValueError("monitored maximum rest must be between 10 and 300 seconds")
+            raise ValueError("monitored maximum rest must be between 10 and 600 seconds")
         if not 1 <= self.max_odds_age_seconds <= 180:
             raise ValueError("monitored odds age must be between 1 and 180 seconds")
         if not 0.01 <= self.failure_grace_seconds <= 60:
@@ -847,7 +847,7 @@ async def execute_monitored_live_order(
     if request.side != "bid":
         raise ValueError("monitored entry is available only for sportsbook-backed YES bids")
     if request.expiration_seconds > HARD_MAX_EXPIRATION_SECONDS:
-        raise ValueError("monitored entry expiration cannot exceed 300 seconds")
+        raise ValueError("monitored entry expiration cannot exceed 600 seconds")
     if config.max_rest_seconds > request.expiration_seconds:
         raise ValueError("monitored maximum rest cannot exceed exchange expiration")
     if initial_snapshot.bookmaker_count < 2:
