@@ -292,6 +292,12 @@ the Kalshi bid or ask falls by the configured adverse-move threshold (two cents 
 default), the independent start is within five minutes, the maximum rest expires, or
 the process is interrupted.
 
+For a specifically confirmed longer-lived test, `--monitor-until-pregame` replaces the
+600-second timeout with exchange expiration five minutes before the independently
+matched event start, capped at 12 hours. The price remains unchanged throughout; the
+same fair, freshness, Kalshi adverse-move, interruption, and fill-race safeguards stay
+active.
+
 Kalshi's authenticated WebSocket supplies real-time order, fill, position, and book
 updates. Authenticated REST reconciliation runs alongside it and always runs after a
 cancellation attempt. A fill already in flight can win the race with cancellation, so

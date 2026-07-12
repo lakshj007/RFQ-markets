@@ -29,6 +29,7 @@ HARD_MAX_SPREAD = Decimal("0.15")
 HARD_MAX_QUEUE_AHEAD = Decimal("500")
 HARD_MAX_TRADE_AGE_SECONDS = 900
 HARD_MAX_EXPIRATION_SECONDS = 600
+HARD_MAX_PREGAME_MONITOR_SECONDS = 12 * 60 * 60
 MAKER_FEE_RATE = Decimal("0.0175")
 TAKER_FEE_RATE = Decimal("0.07")
 INTENT_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{7,39}$")
@@ -177,6 +178,7 @@ class LiveOrderRequest:
     external_start_time: datetime
     expiration_seconds: int
     subaccount: int = 0
+    monitor_until_pregame: bool = False
 
     def validate(self) -> None:
         if self.side not in {"bid", "ask"}:
@@ -191,6 +193,8 @@ class LiveOrderRequest:
             raise ValueError("external start time must include a timezone")
         if self.expiration_seconds < 10:
             raise ValueError("expiration must be at least 10 seconds")
+        if self.expiration_seconds > HARD_MAX_PREGAME_MONITOR_SECONDS:
+            raise ValueError("expiration cannot exceed 12 hours")
         if self.subaccount != 0:
             raise ValueError("only the primary subaccount is enabled for live testing")
 
@@ -230,8 +234,8 @@ class MonitoredEntryConfig:
     def validate(self) -> None:
         if not 0.01 <= self.poll_interval_seconds <= 60:
             raise ValueError("monitored fair polling must be between 0.01 and 60 seconds")
-        if not 10 <= self.max_rest_seconds <= HARD_MAX_EXPIRATION_SECONDS:
-            raise ValueError("monitored maximum rest must be between 10 and 600 seconds")
+        if not 10 <= self.max_rest_seconds <= HARD_MAX_PREGAME_MONITOR_SECONDS:
+            raise ValueError("monitored maximum rest must be between 10 seconds and 12 hours")
         if not 1 <= self.max_odds_age_seconds <= 180:
             raise ValueError("monitored odds age must be between 1 and 180 seconds")
         if not 0.01 <= self.failure_grace_seconds <= 60:
@@ -512,7 +516,10 @@ def preflight_live_order(
     now = now or datetime.now(UTC)
     if request.count > limits.max_contracts:
         raise ValueError("order count exceeds the live contract limit")
-    if request.expiration_seconds > limits.max_expiration_seconds:
+    if (
+        request.expiration_seconds > limits.max_expiration_seconds
+        and not request.monitor_until_pregame
+    ):
         raise ValueError("order expiration exceeds the live expiration limit")
 
     market = client.get_market(request.ticker)
@@ -846,8 +853,13 @@ async def execute_monitored_live_order(
     config.validate()
     if request.side != "bid":
         raise ValueError("monitored entry is available only for sportsbook-backed YES bids")
-    if request.expiration_seconds > HARD_MAX_EXPIRATION_SECONDS:
-        raise ValueError("monitored entry expiration cannot exceed 600 seconds")
+    allowed_expiration = (
+        HARD_MAX_PREGAME_MONITOR_SECONDS
+        if request.monitor_until_pregame
+        else HARD_MAX_EXPIRATION_SECONDS
+    )
+    if request.expiration_seconds > allowed_expiration:
+        raise ValueError("monitored entry expiration exceeds its hard limit")
     if config.max_rest_seconds > request.expiration_seconds:
         raise ValueError("monitored maximum rest cannot exceed exchange expiration")
     if initial_snapshot.bookmaker_count < 2:

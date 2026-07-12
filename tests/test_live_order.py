@@ -173,6 +173,32 @@ def test_preflight_allows_ten_minute_guarded_expiration() -> None:
     assert result.order_expiration_time == now + timedelta(minutes=10)
 
 
+def test_pregame_monitor_mode_allows_bounded_multi_hour_expiration() -> None:
+    now = datetime(2026, 7, 11, 2, tzinfo=UTC)
+    client = FakeLiveClient(now)
+    client.market_start_offset = timedelta(hours=4)
+    pregame_request = LiveOrderRequest(
+        ticker="MARKET",
+        side="bid",
+        price=Decimal("0.16"),
+        count=Decimal("1"),
+        fair_probability=Decimal("0.19"),
+        external_start_time=now + timedelta(hours=4),
+        expiration_seconds=60 * 60,
+        monitor_until_pregame=True,
+    )
+
+    result = preflight_live_order(
+        client,
+        pregame_request,
+        LiveRiskLimits(max_expiration_seconds=600),
+        authenticated=False,
+        now=now,
+    )
+
+    assert result.order_expiration_time == now + timedelta(hours=1)
+
+
 def test_preflight_rejects_crossing_and_insufficient_edge() -> None:
     now = datetime(2026, 7, 11, 2, tzinfo=UTC)
     client = FakeLiveClient(now)

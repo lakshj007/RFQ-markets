@@ -6,7 +6,7 @@ import json
 import os
 import sys
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -650,10 +650,14 @@ def _bounded_exit_from_args(
     return request
 
 
-def _monitor_config(args: argparse.Namespace) -> MonitoredEntryConfig:
+def _monitor_config(
+    args: argparse.Namespace,
+    *,
+    expiration_seconds: int | None = None,
+) -> MonitoredEntryConfig:
     config = MonitoredEntryConfig(
         poll_interval_seconds=args.monitor_poll_seconds,
-        max_rest_seconds=args.expiration_seconds,
+        max_rest_seconds=expiration_seconds or args.expiration_seconds,
         max_odds_age_seconds=min(args.odds_max_age, 60),
         failure_grace_seconds=args.monitor_failure_grace_seconds,
         rest_reconcile_seconds=args.monitor_reconcile_seconds,
@@ -663,6 +667,23 @@ def _monitor_config(args: argparse.Namespace) -> MonitoredEntryConfig:
     if config.poll_interval_seconds < 25:
         raise ValueError("live monitored-entry polling cannot be faster than 25 seconds")
     return config
+
+
+def _entry_expiration_seconds(
+    args: argparse.Namespace,
+    fair: OddsFairSnapshot,
+    *,
+    now: datetime | None = None,
+) -> int:
+    if not args.monitor_until_pregame:
+        return args.expiration_seconds
+    cutoff = fair.event_commence_time.astimezone(UTC) - timedelta(minutes=5)
+    seconds = int((cutoff - (now or datetime.now(UTC))).total_seconds())
+    if seconds < 10:
+        raise ValueError("pregame monitoring cutoff is less than 10 seconds away")
+    if seconds > 12 * 60 * 60:
+        raise ValueError("pregame monitoring cannot exceed 12 hours")
+    return seconds
 
 
 def _parse_live_time(value: str | None, *, argument: str) -> datetime:
@@ -747,6 +768,8 @@ def _cmd_live_order(args: argparse.Namespace) -> None:
     limits = LiveRiskLimits.from_env()
     if args.monitor_entry and (not args.odds_sport or args.fair_probability is not None):
         raise ValueError("--monitor-entry is available only with --odds-sport")
+    if args.monitor_until_pregame and not args.monitor_entry:
+        raise ValueError("--monitor-until-pregame requires --monitor-entry")
     if args.monitor_entry and args.side != "bid":
         raise ValueError("--monitor-entry is available only for a YES entry bid")
     if not args.execute_live:
@@ -761,6 +784,7 @@ def _cmd_live_order(args: argparse.Namespace) -> None:
             args,
             external_start_time=fair.event_commence_time,
         )
+        expiration_seconds = _entry_expiration_seconds(args, fair)
         request = LiveOrderRequest(
             ticker=args.ticker,
             side=args.side,
@@ -768,7 +792,8 @@ def _cmd_live_order(args: argparse.Namespace) -> None:
             count=args.count,
             fair_probability=fair.probability,
             external_start_time=fair.event_commence_time,
-            expiration_seconds=args.expiration_seconds,
+            expiration_seconds=expiration_seconds,
+            monitor_until_pregame=args.monitor_until_pregame,
         )
         preview = preflight_live_order(
             client,
@@ -786,7 +811,7 @@ def _cmd_live_order(args: argparse.Namespace) -> None:
                 "adverse_move": str(args.adverse_move_cents / Decimal("100")),
             }
         if args.monitor_entry:
-            config = _monitor_config(args)
+            config = _monitor_config(args, expiration_seconds=expiration_seconds)
             payload["monitored_entry"] = {
                 "cancel_below": str(request.price + limits.min_edge),
                 "poll_interval_seconds": config.poll_interval_seconds,
@@ -794,6 +819,7 @@ def _cmd_live_order(args: argparse.Namespace) -> None:
                 "max_odds_age_seconds": config.max_odds_age_seconds,
                 "failure_grace_seconds": config.failure_grace_seconds,
                 "adverse_move": str(config.adverse_move),
+                "until_pregame": args.monitor_until_pregame,
             }
         _print_live_preflight(payload, json_output=args.json)
         return
@@ -834,6 +860,7 @@ def _cmd_live_order(args: argparse.Namespace) -> None:
             "bounded auto-exit requires --acknowledge-auto-exit "
             f"{BOUNDED_EXIT_ACKNOWLEDGEMENT}"
         )
+    expiration_seconds = _entry_expiration_seconds(args, fair)
     request = LiveOrderRequest(
         ticker=args.ticker,
         side=args.side,
@@ -841,7 +868,8 @@ def _cmd_live_order(args: argparse.Namespace) -> None:
         count=args.count,
         fair_probability=fair.probability,
         external_start_time=fair.event_commence_time,
-        expiration_seconds=args.expiration_seconds,
+        expiration_seconds=expiration_seconds,
+        monitor_until_pregame=args.monitor_until_pregame,
     )
 
     if odds_source is not None:
@@ -853,7 +881,7 @@ def _cmd_live_order(args: argparse.Namespace) -> None:
                 fair_source=odds_source,
                 initial_snapshot=fair,
                 stream=KalshiWebSocket(client),
-                config=_monitor_config(args),
+                config=_monitor_config(args, expiration_seconds=expiration_seconds),
                 intent_id=args.intent_id,
                 audit_log=LiveAuditLog(args.audit_log),
             )
@@ -1235,6 +1263,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--monitor-entry",
         action="store_true",
         help="monitor sportsbook fair value and cancel the unchanged resting entry",
+    )
+    live_order.add_argument(
+        "--monitor-until-pregame",
+        action="store_true",
+        help="rest the monitored entry until five minutes before the independent start",
     )
     live_order.add_argument("--monitor-poll-seconds", type=float, default=30)
     live_order.add_argument("--monitor-failure-grace-seconds", type=float, default=15)
