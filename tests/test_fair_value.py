@@ -40,12 +40,18 @@ class FairFakeKalshi:
 class FairFakeOdds:
     def __init__(self) -> None:
         self.calls = 0
+        self.event_calls = 0
         self.bookmakers: str | None = None
 
     def get_odds(self, *args, **kwargs) -> list:
         self.calls += 1
         self.bookmakers = kwargs["bookmakers"]
         return [_two_book_event()]
+
+    def get_event_odds(self, sport, event_id, **kwargs):
+        self.event_calls += 1
+        assert event_id == _two_book_event().event_id
+        return _two_book_event()
 
 
 def test_odds_consensus_fair_value_is_cached_between_book_updates() -> None:
@@ -70,4 +76,12 @@ def test_odds_consensus_fair_value_is_cached_between_book_updates() -> None:
     assert snapshot.event_commence_time == _two_book_event().commence_time
     assert snapshot.observed_at.tzinfo is not None
     assert odds.calls == 1
+    assert odds.event_calls == 0
     assert odds.bookmakers == DEFAULT_SHARP_BOOKMAKERS
+
+    refreshed = source.refresh_snapshot("MARKET")
+
+    assert refreshed.event_id == _two_book_event().event_id
+    assert refreshed.bookmaker_count == 2
+    assert odds.calls == 1
+    assert odds.event_calls == 1

@@ -243,6 +243,29 @@ class KalshiClient:
     def get_resting_orders(self, ticker: str, *, subaccount: int = 0) -> list[dict[str, Any]]:
         return self.get_orders(ticker=ticker, status="resting", subaccount=subaccount)
 
+    def get_fills(
+        self,
+        *,
+        ticker: str | None = None,
+        order_id: str | None = None,
+        subaccount: int = 0,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {
+            "subaccount": subaccount,
+            "limit": min(max(limit, 1), 1000),
+        }
+        if ticker:
+            params["ticker"] = ticker
+        if order_id:
+            params["order_id"] = order_id
+        return self._request(
+            "GET",
+            "/portfolio/fills",
+            params=params,
+            authenticated=True,
+        ).get("fills", [])
+
     def create_order(
         self,
         *,

@@ -26,12 +26,15 @@ from .fair_value import (
 from .live_order import (
     BOUNDED_EXIT_ACKNOWLEDGEMENT,
     LIVE_ACKNOWLEDGEMENT,
+    MONITORED_ENTRY_ACKNOWLEDGEMENT,
     BoundedExitRequest,
     LiveAuditLog,
     LiveOrderRequest,
     LiveRiskLimits,
+    MonitoredEntryConfig,
     execute_bounded_exit,
     execute_live_order,
+    execute_monitored_live_order,
     preflight_live_order,
 )
 from .maker_paper import MakerPaperRecorder, MakerPaperUpdate
@@ -580,6 +583,22 @@ def _print_live_preflight(payload: dict[str, object], *, json_output: bool) -> N
         )
     )
     auto_exit = payload.get("auto_exit")
+    monitor = payload.get("monitored_entry")
+    if isinstance(monitor, dict):
+        print("\nBounded fair-value monitor")
+        print(
+            table(
+                ("FIELD", "VALUE"),
+                (
+                    ("Cancel below fair", f"{as_decimal(monitor['cancel_below']) * 100:.2f}%"),
+                    ("Odds poll interval", f"{monitor['poll_interval_seconds']} seconds"),
+                    ("Maximum resting", f"{monitor['max_rest_seconds']} seconds"),
+                    ("Maximum odds age", f"{monitor['max_odds_age_seconds']} seconds"),
+                    ("API failure grace", f"{monitor['failure_grace_seconds']} seconds"),
+                    ("Order handling", "cancel only; never amend or replace"),
+                ),
+            )
+        )
     if isinstance(auto_exit, dict):
         print("\nPreauthorized bounded exit")
         print(
@@ -627,6 +646,20 @@ def _bounded_exit_from_args(
     return request
 
 
+def _monitor_config(args: argparse.Namespace) -> MonitoredEntryConfig:
+    config = MonitoredEntryConfig(
+        poll_interval_seconds=args.monitor_poll_seconds,
+        max_rest_seconds=args.expiration_seconds,
+        max_odds_age_seconds=min(args.odds_max_age, 60),
+        failure_grace_seconds=args.monitor_failure_grace_seconds,
+        rest_reconcile_seconds=args.monitor_reconcile_seconds,
+    )
+    config.validate()
+    if config.poll_interval_seconds < 25:
+        raise ValueError("live monitored-entry polling cannot be faster than 25 seconds")
+    return config
+
+
 def _parse_live_time(value: str | None, *, argument: str) -> datetime:
     if not value:
         raise ValueError(f"{argument} is required")
@@ -649,19 +682,7 @@ def _live_fair_snapshot(
     if choices != 1:
         raise ValueError("choose exactly one live fair source: --fair-probability or --odds-sport")
     if args.odds_sport:
-        return OddsConsensusFairValue(
-            kalshi=client,
-            odds=OddsClient.from_env(),
-            market_ticker=args.ticker,
-            sport=args.odds_sport,
-            regions=args.odds_regions,
-            bookmakers=args.odds_bookmakers,
-            min_bookmakers=args.odds_min_bookmakers,
-            max_age_seconds=min(args.odds_max_age, 60),
-            refresh_seconds=1,
-            match_window_hours=args.odds_match_window_hours,
-            include_live=False,
-        ).snapshot(args.ticker)
+        return _live_odds_source(args, client).snapshot(args.ticker)
 
     observed_at = _parse_live_time(
         args.fair_observed_at,
@@ -682,6 +703,27 @@ def _live_fair_snapshot(
     )
 
 
+def _live_odds_source(
+    args: argparse.Namespace,
+    client: KalshiClient,
+) -> OddsConsensusFairValue:
+    if not args.odds_sport:
+        raise ValueError("monitored entry requires --odds-sport")
+    return OddsConsensusFairValue(
+        kalshi=client,
+        odds=OddsClient.from_env(),
+        market_ticker=args.ticker,
+        sport=args.odds_sport,
+        regions=args.odds_regions,
+        bookmakers=args.odds_bookmakers,
+        min_bookmakers=max(2, args.odds_min_bookmakers),
+        max_age_seconds=min(args.odds_max_age, 60),
+        refresh_seconds=1,
+        match_window_hours=args.odds_match_window_hours,
+        include_live=False,
+    )
+
+
 def _production_client() -> KalshiClient:
     client = KalshiClient.from_production_env()
     if not client.has_credentials:
@@ -698,9 +740,18 @@ def _production_client() -> KalshiClient:
 
 def _cmd_live_order(args: argparse.Namespace) -> None:
     limits = LiveRiskLimits.from_env()
+    if args.monitor_entry and (not args.odds_sport or args.fair_probability is not None):
+        raise ValueError("--monitor-entry is available only with --odds-sport")
+    if args.monitor_entry and args.side != "bid":
+        raise ValueError("--monitor-entry is available only for a YES entry bid")
     if not args.execute_live:
         client = _client()
-        fair = _live_fair_snapshot(args, client)
+        odds_source = _live_odds_source(args, client) if args.monitor_entry else None
+        fair = (
+            odds_source.snapshot(args.ticker)
+            if odds_source is not None
+            else _live_fair_snapshot(args, client)
+        )
         bounded_exit = _bounded_exit_from_args(
             args,
             external_start_time=fair.event_commence_time,
@@ -727,6 +778,15 @@ def _cmd_live_order(args: argparse.Namespace) -> None:
                 "floor_price": str(bounded_exit.floor_price),
                 "target_wait_seconds": bounded_exit.target_wait_seconds,
             }
+        if args.monitor_entry:
+            config = _monitor_config(args)
+            payload["monitored_entry"] = {
+                "cancel_below": str(request.price + limits.min_edge),
+                "poll_interval_seconds": config.poll_interval_seconds,
+                "max_rest_seconds": config.max_rest_seconds,
+                "max_odds_age_seconds": config.max_odds_age_seconds,
+                "failure_grace_seconds": config.failure_grace_seconds,
+            }
         _print_live_preflight(payload, json_output=args.json)
         return
 
@@ -738,9 +798,22 @@ def _cmd_live_order(args: argparse.Namespace) -> None:
         raise ValueError("--confirm-ticker must exactly match --ticker")
     if not args.intent_id:
         raise ValueError("--execute-live requires a unique --intent-id")
+    if (
+        args.monitor_entry
+        and args.acknowledge_monitored_entry != MONITORED_ENTRY_ACKNOWLEDGEMENT
+    ):
+        raise ValueError(
+            "monitored live entry requires --acknowledge-monitored-entry "
+            f"{MONITORED_ENTRY_ACKNOWLEDGEMENT}"
+        )
     client = _production_client()
 
-    fair = _live_fair_snapshot(args, client)
+    odds_source = _live_odds_source(args, client) if args.monitor_entry else None
+    fair = (
+        odds_source.snapshot(args.ticker)
+        if odds_source is not None
+        else _live_fair_snapshot(args, client)
+    )
     bounded_exit = _bounded_exit_from_args(
         args,
         external_start_time=fair.event_commence_time,
@@ -763,15 +836,30 @@ def _cmd_live_order(args: argparse.Namespace) -> None:
         expiration_seconds=args.expiration_seconds,
     )
 
-    result = execute_live_order(
-        client,
-        request,
-        limits,
-        intent_id=args.intent_id,
-        audit_log=LiveAuditLog(args.audit_log),
-        wait_seconds=args.wait_seconds,
-        poll_seconds=args.poll_seconds,
-    )
+    if odds_source is not None:
+        result = asyncio.run(
+            execute_monitored_live_order(
+                client,
+                request,
+                limits,
+                fair_source=odds_source,
+                initial_snapshot=fair,
+                stream=KalshiWebSocket(client),
+                config=_monitor_config(args),
+                intent_id=args.intent_id,
+                audit_log=LiveAuditLog(args.audit_log),
+            )
+        )
+    else:
+        result = execute_live_order(
+            client,
+            request,
+            limits,
+            intent_id=args.intent_id,
+            audit_log=LiveAuditLog(args.audit_log),
+            wait_seconds=args.wait_seconds,
+            poll_seconds=args.poll_seconds,
+        )
     if bounded_exit is not None:
         position = as_decimal(client.get_position(args.ticker, subaccount=0))
         result["auto_exit"] = (
@@ -1117,10 +1205,19 @@ def build_parser() -> argparse.ArgumentParser:
     live_order.add_argument("--expiration-seconds", type=int, default=120)
     live_order.add_argument("--wait-seconds", type=int, default=60)
     live_order.add_argument("--poll-seconds", type=float, default=2)
+    live_order.add_argument(
+        "--monitor-entry",
+        action="store_true",
+        help="monitor sportsbook fair value and cancel the unchanged resting entry",
+    )
+    live_order.add_argument("--monitor-poll-seconds", type=float, default=30)
+    live_order.add_argument("--monitor-failure-grace-seconds", type=float, default=15)
+    live_order.add_argument("--monitor-reconcile-seconds", type=float, default=10)
     live_order.add_argument("--auto-exit-target-cents", type=_decimal)
     live_order.add_argument("--auto-exit-floor-cents", type=_decimal)
     live_order.add_argument("--auto-exit-wait-seconds", type=int, default=60)
     live_order.add_argument("--acknowledge-auto-exit")
+    live_order.add_argument("--acknowledge-monitored-entry")
     live_order.add_argument("--audit-log", type=Path, default=Path("logs/live-orders.jsonl"))
     live_order.add_argument("--execute-live", action="store_true")
     live_order.add_argument("--acknowledge-risk")

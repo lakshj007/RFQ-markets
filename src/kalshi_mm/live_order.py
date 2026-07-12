@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import os
 import re
@@ -12,11 +14,14 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .client import KalshiAPIError
+from .fair_value import OddsFairSnapshot, OddsFairValueUnavailable
 from .models import ONE, ZERO, OrderBook, PriceGrid, as_decimal
+from .ws import KalshiWebSocket, StreamUpdate
 
 LIVE_ENABLE_TOKEN = "I_UNDERSTAND_REAL_MONEY"
 LIVE_ACKNOWLEDGEMENT = "REAL_MONEY_ONE_CONTRACT"
 BOUNDED_EXIT_ACKNOWLEDGEMENT = "BOUNDED_REDUCE_ONLY_EXIT"
+MONITORED_ENTRY_ACKNOWLEDGEMENT = "MONITOR_ODDS_AND_CANCEL_ENTRY"
 HARD_MAX_CONTRACTS = Decimal("1")
 HARD_MAX_ORDER_COST = Decimal("1")
 HARD_MIN_EDGE = Decimal("0.02")
@@ -51,6 +56,15 @@ class LiveOrderClient(Protocol):
         limit: int = 100,
     ) -> list[dict[str, Any]]: ...
 
+    def get_fills(
+        self,
+        *,
+        ticker: str | None = None,
+        order_id: str | None = None,
+        subaccount: int = 0,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]: ...
+
     def create_order(
         self,
         *,
@@ -68,6 +82,10 @@ class LiveOrderClient(Protocol):
     ) -> dict[str, Any]: ...
 
     def cancel_order(self, order_id: str, *, subaccount: int = 0) -> dict[str, Any]: ...
+
+
+class MonitoredFairSource(Protocol):
+    def refresh_snapshot(self, ticker: str) -> OddsFairSnapshot: ...
 
 
 def _env_decimal(name: str, default: str) -> Decimal:
@@ -198,6 +216,27 @@ class BoundedExitRequest:
             raise ValueError("external start time must include a timezone")
         if self.subaccount != 0:
             raise ValueError("only the primary subaccount is enabled for live testing")
+
+
+@dataclass(frozen=True, slots=True)
+class MonitoredEntryConfig:
+    poll_interval_seconds: float = 30
+    max_rest_seconds: int = HARD_MAX_EXPIRATION_SECONDS
+    max_odds_age_seconds: float = 60
+    failure_grace_seconds: float = 15
+    rest_reconcile_seconds: float = 10
+
+    def validate(self) -> None:
+        if not 0.01 <= self.poll_interval_seconds <= 60:
+            raise ValueError("monitored fair polling must be between 0.01 and 60 seconds")
+        if not 10 <= self.max_rest_seconds <= HARD_MAX_EXPIRATION_SECONDS:
+            raise ValueError("monitored maximum rest must be between 10 and 300 seconds")
+        if not 1 <= self.max_odds_age_seconds <= 180:
+            raise ValueError("monitored odds age must be between 1 and 180 seconds")
+        if not 0.01 <= self.failure_grace_seconds <= 60:
+            raise ValueError("monitored failure grace must be between 0.01 and 60 seconds")
+        if not 0.01 <= self.rest_reconcile_seconds <= 30:
+            raise ValueError("REST reconciliation must be between 0.01 and 30 seconds")
 
 
 @dataclass(frozen=True, slots=True)
@@ -732,6 +771,370 @@ def execute_live_order(
                         "cancel_on_exit_failed",
                         {"order_id": order_id, "error": str(exc)},
                     )
+
+
+def _fair_snapshot_payload(snapshot: OddsFairSnapshot) -> dict[str, object]:
+    return {
+        "probability": str(snapshot.probability),
+        "event_commence_time": snapshot.event_commence_time.isoformat(),
+        "observed_at": snapshot.observed_at.isoformat(),
+        "event_id": snapshot.event_id,
+        "bookmaker_count": snapshot.bookmaker_count,
+        "bookmaker_keys": list(snapshot.bookmaker_keys),
+        "oldest_update": (
+            snapshot.oldest_update.isoformat() if snapshot.oldest_update is not None else None
+        ),
+        "quota_remaining": snapshot.quota_remaining,
+    }
+
+
+def _fill_fee(fill: dict[str, Any]) -> Decimal:
+    for key in ("fee_cost", "fee_cost_dollars", "fees_paid_dollars"):
+        if fill.get(key) is not None:
+            return as_decimal(fill[key])
+    return ZERO
+
+
+def _next_fair_delay(snapshot: OddsFairSnapshot, config: MonitoredEntryConfig) -> float:
+    if snapshot.oldest_update is None:
+        return 0.01
+    age = max(0.0, (snapshot.observed_at - snapshot.oldest_update).total_seconds())
+    freshness_remaining = max(0.01, config.max_odds_age_seconds - age)
+    return min(config.poll_interval_seconds, freshness_remaining)
+
+
+async def execute_monitored_live_order(
+    client: LiveOrderClient,
+    request: LiveOrderRequest,
+    limits: LiveRiskLimits,
+    *,
+    fair_source: MonitoredFairSource,
+    initial_snapshot: OddsFairSnapshot,
+    stream: KalshiWebSocket,
+    config: MonitoredEntryConfig,
+    intent_id: str,
+    audit_log: LiveAuditLog,
+    now: datetime | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> dict[str, object]:
+    """Rest one unchanged entry while fair value and exchange state are monitored."""
+    if os.getenv("KALSHI_LIVE_TRADING_ENABLED") != LIVE_ENABLE_TOKEN:
+        raise ValueError(
+            f"set KALSHI_LIVE_TRADING_ENABLED={LIVE_ENABLE_TOKEN} to enable real orders"
+        )
+    config.validate()
+    if request.side != "bid":
+        raise ValueError("monitored entry is available only for sportsbook-backed YES bids")
+    if request.expiration_seconds > HARD_MAX_EXPIRATION_SECONDS:
+        raise ValueError("monitored entry expiration cannot exceed 300 seconds")
+    if config.max_rest_seconds > request.expiration_seconds:
+        raise ValueError("monitored maximum rest cannot exceed exchange expiration")
+    if initial_snapshot.bookmaker_count < 2:
+        raise ValueError("monitored entry requires at least two fresh bookmakers")
+    effective_now = now or datetime.now(UTC)
+    if initial_snapshot.oldest_update is None:
+        raise ValueError("monitored entry requires timestamped sportsbook prices")
+    initial_age = (effective_now - initial_snapshot.oldest_update).total_seconds()
+    if initial_age < -5 or initial_age > config.max_odds_age_seconds:
+        raise ValueError("monitored entry requires fresh sportsbook prices")
+    if initial_snapshot.quota_remaining is not None and initial_snapshot.quota_remaining <= 0:
+        raise ValueError("Odds API quota is exhausted; refusing monitored entry")
+
+    client_order_id = live_client_order_id(intent_id)
+    existing = client.get_orders(ticker=request.ticker, subaccount=request.subaccount, limit=1000)
+    duplicate = next(
+        (item for item in existing if item.get("client_order_id") == client_order_id), None
+    )
+    if duplicate:
+        result = {
+            "result": "reconciled_existing",
+            "client_order_id": client_order_id,
+            "order": duplicate,
+        }
+        audit_log.append("reconciled_existing", result)
+        return result
+
+    preflight = preflight_live_order(
+        client,
+        request,
+        limits,
+        authenticated=True,
+        now=effective_now,
+    )
+    initial_position = preflight.position or ZERO
+    cancellation_threshold = request.price + limits.min_edge
+    audit_log.append(
+        "monitored_intent_validated",
+        {
+            "client_order_id": client_order_id,
+            "preflight": preflight.as_dict(),
+            "cancellation_threshold": str(cancellation_threshold),
+            "poll_interval_seconds": config.poll_interval_seconds,
+            "max_rest_seconds": config.max_rest_seconds,
+            "max_odds_age_seconds": config.max_odds_age_seconds,
+            "failure_grace_seconds": config.failure_grace_seconds,
+        },
+    )
+    audit_log.append("fair_snapshot", _fair_snapshot_payload(initial_snapshot))
+
+    queue: asyncio.Queue[StreamUpdate] = asyncio.Queue(maxsize=4096)
+
+    async def pump_stream() -> None:
+        try:
+            async for update in stream.events([request.ticker]):
+                await queue.put(update)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            audit_log.append(
+                "websocket_monitor_failed",
+                {"error_type": type(exc).__name__, "error": str(exc)},
+            )
+
+    stream_task = asyncio.create_task(pump_stream())
+    order_id: str | None = None
+    cancellation_reason: str | None = None
+    terminal_reason: str | None = None
+    failure_started: float | None = None
+    unexpected: BaseException | None = None
+    cancellation: dict[str, Any] | None = None
+    try:
+        response = client.create_order(
+            ticker=request.ticker,
+            client_order_id=client_order_id,
+            side=request.side,
+            count=format(request.count, "f"),
+            price=format_fixed_price(request.price),
+            expiration_time=int(preflight.order_expiration_time.timestamp()),
+            reduce_only=False,
+            subaccount=request.subaccount,
+            post_only=True,
+            cancel_order_on_pause=True,
+        )
+        if response.get("error"):
+            raise RuntimeError(f"order rejected: {response['error']}")
+        order_id = str(response["order_id"])
+        audit_log.append("monitored_submitted", {"order_id": order_id, "response": response})
+
+        started = monotonic()
+        deadline = started + config.max_rest_seconds
+        next_fair = started + _next_fair_delay(initial_snapshot, config)
+        next_reconcile = started + config.rest_reconcile_seconds
+        while True:
+            current_time = monotonic()
+            wall_now = (
+                effective_now + timedelta(seconds=current_time - started)
+                if now is not None
+                else datetime.now(UTC)
+            )
+            if wall_now >= request.external_start_time.astimezone(UTC) - timedelta(minutes=5):
+                cancellation_reason = "event_start_within_five_minutes"
+                break
+            if current_time >= deadline:
+                cancellation_reason = "maximum_rest_timeout"
+                break
+
+            timeout = max(0.0, min(deadline, next_fair, next_reconcile) - current_time)
+            update: StreamUpdate | None = None
+            with contextlib.suppress(TimeoutError):
+                update = await asyncio.wait_for(queue.get(), timeout=timeout)
+
+            if update is not None:
+                message_type = update.message.get("type")
+                payload = update.message.get("msg", {})
+                update_order_id = str(payload.get("order_id", ""))
+                if message_type == "fill" and update_order_id == order_id:
+                    audit_log.append("websocket_fill", {"order_id": order_id, "fill": payload})
+                    cancellation_reason = "fill_detected_cancel_remainder"
+                    break
+                if message_type == "user_order" and update_order_id == order_id:
+                    audit_log.append(
+                        "websocket_order", {"order_id": order_id, "order": payload}
+                    )
+                    if payload.get("status") != "resting":
+                        terminal_reason = str(payload.get("status", "terminal"))
+                        break
+                if message_type == "market_position":
+                    ticker = payload.get("market_ticker") or payload.get("ticker")
+                    if ticker == request.ticker:
+                        audit_log.append("websocket_position", {"position": payload})
+
+            current_time = monotonic()
+            if current_time >= next_reconcile:
+                orders = client.get_orders(
+                    ticker=request.ticker,
+                    subaccount=request.subaccount,
+                    limit=1000,
+                )
+                current = next(
+                    (item for item in orders if item.get("order_id") == order_id), None
+                )
+                audit_log.append(
+                    "rest_reconciliation",
+                    {"order_id": order_id, "order": current},
+                )
+                if current is not None and current.get("status") != "resting":
+                    terminal_reason = str(current.get("status", "terminal"))
+                    break
+                next_reconcile = current_time + config.rest_reconcile_seconds
+
+            if current_time >= next_fair:
+                try:
+                    snapshot = fair_source.refresh_snapshot(request.ticker)
+                except OddsFairValueUnavailable as exc:
+                    audit_log.append(
+                        "fair_unavailable",
+                        {"reason": exc.reason, "error": str(exc)},
+                    )
+                    cancellation_reason = exc.reason
+                    break
+                except Exception as exc:
+                    if failure_started is None:
+                        failure_started = current_time
+                    elapsed = current_time - failure_started
+                    audit_log.append(
+                        "fair_refresh_failed",
+                        {
+                            "error_type": type(exc).__name__,
+                            "error": str(exc),
+                            "failure_elapsed_seconds": elapsed,
+                            "failure_grace_seconds": config.failure_grace_seconds,
+                        },
+                    )
+                    if elapsed >= config.failure_grace_seconds:
+                        cancellation_reason = "odds_api_failure_grace_expired"
+                        break
+                    next_fair = current_time + min(5.0, config.failure_grace_seconds - elapsed)
+                else:
+                    failure_started = None
+                    audit_log.append("fair_snapshot", _fair_snapshot_payload(snapshot))
+                    if snapshot.bookmaker_count < 2:
+                        cancellation_reason = "insufficient_bookmakers"
+                        break
+                    if snapshot.probability < cancellation_threshold:
+                        cancellation_reason = "fair_below_threshold"
+                        break
+                    if snapshot.quota_remaining is not None and snapshot.quota_remaining <= 0:
+                        cancellation_reason = "odds_api_quota_exhausted"
+                        break
+                    next_fair = current_time + _next_fair_delay(snapshot, config)
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        cancellation_reason = "interrupted"
+    except BaseException as exc:
+        cancellation_reason = "internal_error"
+        unexpected = exc
+    finally:
+        if order_id is None:
+            recovered = next(
+                (
+                    item
+                    for item in client.get_orders(
+                        ticker=request.ticker,
+                        subaccount=request.subaccount,
+                        limit=1000,
+                    )
+                    if item.get("client_order_id") == client_order_id
+                ),
+                None,
+            )
+            if recovered is not None:
+                order_id = str(recovered["order_id"])
+                audit_log.append(
+                    "recovered_after_submit_error", {"order_id": order_id, "order": recovered}
+                )
+        if order_id is not None and cancellation_reason is not None:
+            audit_log.append(
+                "cancellation_requested",
+                {"order_id": order_id, "reason": cancellation_reason},
+            )
+            try:
+                cancellation = client.cancel_order(order_id, subaccount=request.subaccount)
+                audit_log.append(
+                    "cancellation_response",
+                    {
+                        "order_id": order_id,
+                        "reason": cancellation_reason,
+                        "response": cancellation,
+                    },
+                )
+            except Exception as exc:
+                if isinstance(exc, KalshiAPIError) and exc.status_code == 404:
+                    audit_log.append(
+                        "cancellation_response",
+                        {
+                            "order_id": order_id,
+                            "reason": cancellation_reason,
+                            "response": {"status": "not_found_requires_reconciliation"},
+                        },
+                    )
+                else:
+                    audit_log.append(
+                        "cancellation_failed",
+                        {"order_id": order_id, "reason": cancellation_reason, "error": str(exc)},
+                    )
+        stream_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await stream_task
+
+    if order_id is None:
+        if unexpected is not None:
+            raise unexpected
+        raise RuntimeError("monitored order submission could not be reconciled")
+
+    orders = client.get_orders(ticker=request.ticker, subaccount=request.subaccount, limit=1000)
+    final_order = next((item for item in orders if item.get("order_id") == order_id), None)
+    fills = client.get_fills(
+        ticker=request.ticker,
+        order_id=order_id,
+        subaccount=request.subaccount,
+        limit=1000,
+    )
+    final_position = as_decimal(
+        client.get_position(request.ticker, subaccount=request.subaccount)
+    )
+    fee = sum((_fill_fee(fill) for fill in fills), ZERO)
+    filled = bool(fills) or final_position > initial_position
+    if cancellation_reason is not None and filled:
+        audit_log.append(
+            "fill_race",
+            {
+                "order_id": order_id,
+                "cancellation_reason": cancellation_reason,
+                "fills": fills,
+                "final_order": final_order,
+            },
+        )
+    audit_log.append(
+        "monitored_final_reconciliation",
+        {
+            "order_id": order_id,
+            "final_order": final_order,
+            "fills": fills,
+            "final_position": str(final_position),
+            "fee": str(fee),
+        },
+    )
+    if unexpected is not None:
+        raise unexpected
+    final_status = str(final_order.get("status")) if final_order is not None else "unknown"
+    if cancellation_reason is not None and filled:
+        result_name = "filled_after_cancel_race"
+    elif cancellation_reason is not None and final_status == "resting":
+        result_name = "cancel_unconfirmed_order_still_resting"
+    elif cancellation_reason is not None:
+        result_name = f"cancelled_{cancellation_reason}"
+    else:
+        result_name = terminal_reason or final_status
+    return {
+        "result": result_name,
+        "order_id": order_id,
+        "cancellation_reason": cancellation_reason,
+        "cancellation": cancellation,
+        "order": final_order,
+        "fills": fills,
+        "final_position": str(final_position),
+        "fee": str(fee),
+    }
 
 
 def execute_bounded_exit(

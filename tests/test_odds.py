@@ -79,6 +79,34 @@ def test_odds_client_sends_key_without_exposing_it_in_models() -> None:
     assert "secret" not in repr(events)
 
 
+class FakeEventResponse(FakeResponse):
+    def json(self) -> dict:
+        return odds_event_payload()
+
+
+class FakeEventSession(FakeSession):
+    def get(self, url: str, *, params: dict, timeout: float) -> FakeEventResponse:
+        assert url.endswith("/sports/baseball_mlb/events/event-1/odds")
+        self.params = params
+        return FakeEventResponse()
+
+
+def test_odds_client_refreshes_one_matched_event() -> None:
+    session = FakeEventSession()
+    client = OddsClient(api_key="secret", session=session)  # type: ignore[arg-type]
+
+    event = client.get_event_odds(
+        "baseball_mlb",
+        "event-1",
+        bookmakers="book-a,book-b",
+    )
+
+    assert event.event_id == "event-1"
+    assert session.params is not None
+    assert session.params["markets"] == "h2h"
+    assert session.params["bookmakers"] == "book-a,book-b"
+
+
 class FakeErrorResponse(FakeResponse):
     ok = False
     status_code = 401

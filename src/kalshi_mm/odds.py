@@ -194,3 +194,27 @@ class OddsClient:
         if not isinstance(payload, list):
             raise OddsAPIError(200, f"/sports/{sport}/odds", "expected a JSON array")
         return [parse_event(item) for item in payload]
+
+    def get_event_odds(
+        self,
+        sport: str,
+        event_id: str,
+        *,
+        regions: str = "us",
+        markets: str = "h2h",
+        bookmakers: str | None = None,
+    ) -> OddsEvent:
+        """Fetch one already-matched event instead of repeatedly scanning a league."""
+        params: dict[str, Any] = {
+            "regions": regions,
+            "markets": markets,
+            "oddsFormat": "decimal",
+            "dateFormat": "iso",
+        }
+        if bookmakers:
+            params["bookmakers"] = bookmakers
+        path = f"/sports/{sport}/events/{event_id}/odds"
+        payload = self._get(path, params=params)
+        if not isinstance(payload, dict):
+            raise OddsAPIError(200, path, "expected a JSON object")
+        return parse_event(payload)

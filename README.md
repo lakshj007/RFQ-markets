@@ -259,6 +259,49 @@ attempts cancellation on interruption or error and writes an append-only audit t
 to `logs/live-orders.jsonl`. If submission returns an ambiguous network error, it
 reconciles by client order ID and cancels any recovered resting order.
 
+### Monitored resting entry
+
+Sportsbook-backed YES entries can opt into a bounded fair-value monitor. The original
+post-only order remains at its submitted price; the monitor can only leave it alone or
+cancel it, never amend, replace, or submit a second entry. The preview shows the initial
+fair and edge, the exact cancellation threshold (entry price plus the hard two-cent
+edge), poll interval, maximum resting duration, odds staleness limit, API failure grace,
+and any attached bounded exit:
+
+```bash
+kalshi-mm live-order \
+  --ticker MARKET-TICKER \
+  --side bid \
+  --price-cents 60 \
+  --odds-sport basketball_nba \
+  --expiration-seconds 120 \
+  --monitor-entry
+```
+
+Live execution additionally requires the exact acknowledgement
+`--acknowledge-monitored-entry MONITOR_ODDS_AND_CANCEL_ENTRY` along with every normal
+live-order gate. The default sportsbook poll interval is 30 seconds and production
+polling cannot be configured below 25 seconds. The initial league response is used to
+safely match one event; later polls use The Odds API's single-event endpoint. Each
+refresh requires at least two timestamped, fresh bookmakers and recomputes the same
+no-vig consensus. The order is canceled when fair falls below the threshold, too few
+books remain, odds become stale, the quota is exhausted, the API failure grace expires,
+the independent start is within five minutes, the maximum rest expires, or the process
+is interrupted.
+
+Kalshi's authenticated WebSocket supplies real-time order, fill, position, and book
+updates. Authenticated REST reconciliation runs alongside it and always runs after a
+cancellation attempt. A fill already in flight can win the race with cancellation, so
+the result is not treated as canceled until orders, fills, fees, and final position are
+reconciled. If a position exists and a bounded exit was preauthorized, that existing
+bounded reduce-only exit starts after reconciliation.
+
+The Odds API does not document a WebSocket for featured pregame odds. Those prices
+generally update around once per minute, so 30-second internal polling cannot remove
+upstream latency. Kalshi book moves arrive faster, but are not an independent fair-value
+source by themselves. Cancellation also cannot prevent a match that was already in
+flight when the cancel reached the exchange.
+
 An entry may include a preauthorized bounded exit. This posts one reduce-only target
 ask after an entry fill. If the target does not fill during the configured wait, the
 target is canceled and the current book is refreshed. The program then makes at most
