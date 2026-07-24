@@ -105,3 +105,44 @@ def test_create_order_supports_reduce_only_ioc_exit(monkeypatch) -> None:
     assert payload["post_only"] is False
     assert payload["time_in_force"] == "immediate_or_cancel"
     assert "expiration_time" not in payload
+
+
+class QuoteResponse(FakeResponse):
+    def json(self) -> dict:
+        return {"id": "quote-1"}
+
+
+class QuoteSession(RecordingSession):
+    def request(self, method: str, url: str, **kwargs) -> QuoteResponse:
+        self.calls.append({"method": method, "url": url, **kwargs})
+        return QuoteResponse()
+
+
+def test_create_and_confirm_rfq_quote_use_communications_endpoints(monkeypatch) -> None:
+    session = QuoteSession()
+    client = KalshiClient(session=session)  # type: ignore[arg-type]
+    monkeypatch.setattr(client, "_auth_headers", lambda method, path: {"auth": "test"})
+
+    quote_id = client.create_rfq_quote(
+        rfq_id="rfq-1",
+        yes_bid="0.53",
+        no_bid="0.43",
+        subaccount=2,
+    )
+    client.confirm_rfq_quote("rfq-1", quote_id)
+
+    assert quote_id == "quote-1"
+    assert session.calls[0]["url"].endswith("/communications/quotes")
+    assert session.calls[0]["json"] == {
+        "rfq_id": "rfq-1",
+        "yes_bid": "0.53",
+        "no_bid": "0.43",
+        "rest_remainder": False,
+        "post_only": True,
+        "subaccount": 2,
+    }
+    assert session.calls[1]["method"] == "PUT"
+    assert session.calls[1]["url"].endswith(
+        "/communications/rfqs/rfq-1/quotes/quote-1/confirm"
+    )
+    assert session.calls[1]["json"] == {}

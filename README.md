@@ -1,10 +1,10 @@
 # Kalshi sports market-maker sample
 
 This repository is a dry-run-first implementation for exploring Kalshi sports markets
-and generating two-sided quotes. Continuous execution remains restricted to Kalshi's
-demo environment. Production execution is limited to a separate, guarded, one-shot
-`live-order` command for a single pregame contract; automated production market making
-and in-play order entry are not enabled.
+and generating two-sided quotes. Public-order-book market making remains restricted to
+Kalshi's demo environment. A separate RFQ maker can quote and auto-confirm production
+moneyline RFQs behind explicit credentials, ticker allowlists, acknowledgements, fresh
+external fair values, and bounded exposure. In-play RFQs remain disabled by default.
 
 The implementation targets the API shape documented in June 2026:
 
@@ -176,6 +176,136 @@ kalshi-mm run \
 ```
 
 The sample uses `post_only=true`, `cancel_order_on_pause=true`, `taker_at_cross` self-trade prevention, client-generated order IDs, and a maximum inventory cutoff. On normal exit or Ctrl-C it attempts to cancel every order it created during that process.
+
+## Moneyline RFQ maker
+
+The RFQ maker listens to Kalshi's authenticated `communications` WebSocket channel.
+It receives `rfq_created`, `rfq_deleted`, `quote_accepted`, and `quote_executed` without
+polling. Kalshi currently exposes quote creation and confirmation as authenticated REST
+writes, so those are the only network calls in the hot quote/confirm path.
+This follows Kalshi's current [RFQ flow](https://docs.kalshi.com/getting_started/rfqs).
+
+Pricing is deliberately simple. Given an external no-vig YES probability `p` and a
+proportional edge rate `e`, the maker sends:
+
+```text
+yes_bid <= p × (1 - e)
+no_bid  <= (1 - p) × (1 - e)
+```
+
+Both prices are rounded down to the market's current `price_ranges` grid. With the hard
+minimum `e = 2%`, each executable side is at least 2% below that outcome's fair value
+and the two raw bids sum to `$0.98` before grid rounding. At a 30% YES fair, the raw
+quotes are 29.4 cents for YES and 68.6 cents for NO, giving absolute edges of 0.6 cents
+and 1.4 cents respectively. This is proportional price edge before exchange fees and
+fee rounding; increase `--edge-percent` if the required return must be net of those
+costs.
+
+The fast external-feed interface is an atomically replaced JSON file. Each entry must
+explicitly identify a fresh, pregame moneyline:
+
+```json
+{
+  "markets": {
+    "KALSHI-MARKET-TICKER": {
+      "probability": "0.55",
+      "observed_at": "2026-07-24T18:30:00Z",
+      "event_start": "2026-07-24T23:10:00Z",
+      "market_type": "moneyline",
+      "source": "your-low-latency-feed"
+    }
+  }
+}
+```
+
+The file is cached and checked for updates every 250ms by default; an RFQ reads the
+in-memory snapshot. First run against demo RFQs without writing quotes:
+
+```bash
+kalshi-mm rfq-maker \
+  --demo \
+  --fair-file rfq-fairs.json \
+  --allow-ticker DEMO-MARKET-TICKER \
+  --edge-percent 2 \
+  --max-fair-age 5 \
+  --min-contracts 1 \
+  --max-contracts 1 \
+  --seconds 60
+```
+
+To submit and auto-confirm in demo, add both guarded flags:
+
+```bash
+kalshi-mm rfq-maker \
+  --fair-file rfq-fairs.json \
+  --allow-ticker DEMO-MARKET-TICKER \
+  --execute-demo \
+  --acknowledge-risk DEMO_ONLY
+```
+
+For a slower turnkey pregame source, the maker can build and refresh an in-memory
+two-way no-vig consensus from The Odds API. Matching happens before RFQs arrive, not in
+the quote path:
+
+```bash
+kalshi-mm rfq-maker \
+  --series KXMLBGAME \
+  --odds-sport baseball_mlb \
+  --odds-refresh 30 \
+  --max-fair-age 60
+```
+
+Production execution requires production-only Kalshi credentials, at least one exact
+ticker allowlist entry, an ephemeral enable variable, and the exact acknowledgement:
+
+```bash
+export KALSHI_RFQ_LIVE_ENABLED='I_UNDERSTAND_RFQ_REAL_MONEY'
+
+kalshi-mm rfq-maker \
+  --fair-file rfq-fairs.json \
+  --allow-ticker KALSHI-MARKET-TICKER \
+  --edge-percent 2 \
+  --max-fair-age 5 \
+  --min-contracts 1 \
+  --max-contracts 1 \
+  --max-position 2 \
+  --max-notional 1 \
+  --execute-live \
+  --acknowledge-risk REAL_MONEY_RFQ_AUTOCONFIRM
+
+unset KALSHI_RFQ_LIVE_ENABLED
+```
+
+The maker rechecks fair-value age, event start, accepted side, accepted size, and the
+full configured edge immediately before confirmation. It reserves balance and both
+directional position outcomes across outstanding quotes, retains accepted exposure
+through Kalshi's execution timer, uses `post_only=true`, and never rests a remainder.
+It reconciles quote state and portfolio risk every 15 seconds, refuses to start over
+unresolved quotes from an earlier process, and cancels its unaccepted quotes on clean
+shutdown. Every decision and measured quote/confirmation latency is appended to
+`logs/rfq-maker.jsonl`.
+
+### RFQ event workflow
+
+1. Refresh and safely match pregame moneyline fair values before handling RFQs. JSON
+   feeds are checked every 250ms; the Odds API source refreshes on its configured
+   interval.
+2. Receive `rfq_created` on the authenticated `communications` WebSocket and reject
+   non-moneylines, combos, target-cost requests, stale fairs, disallowed tickers, and
+   sizes outside the configured limits.
+3. Calculate both outcome bids as `outcome_fair × (1 - edge_rate)`, then round each bid
+   down to the market's valid price grid. Rounding down can only increase our edge.
+4. Reserve worst-case balance and directional inventory locally, then submit the quote
+   through `POST /communications/quotes`.
+5. On `quote_accepted`, reload the latest cached fair and recompute the proportional
+   edge for the accepted side. Confirm only if the full configured percentage remains.
+6. Retain the exposure reservation through Kalshi's execution timer, reconcile it from
+   quote and portfolio state, and release it after execution or cancellation.
+7. Cancel all unaccepted quotes on clean shutdown; refuse a new executable session if
+   unresolved quotes from an earlier process still exist.
+
+The initial scope intentionally rejects combo RFQs and `target_cost_dollars` RFQs. It
+quotes only `contracts_fp` requests for explicitly cached two-outcome moneylines.
 
 ## Guarded production order
 

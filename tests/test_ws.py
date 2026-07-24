@@ -4,7 +4,12 @@ from decimal import Decimal
 
 import pytest
 
-from kalshi_mm.ws import KalshiStreamState, KalshiWebSocket, SequenceGapError
+from kalshi_mm.ws import (
+    KalshiRFQWebSocket,
+    KalshiStreamState,
+    KalshiWebSocket,
+    SequenceGapError,
+)
 
 
 def snapshot(sequence: int = 10) -> dict:
@@ -104,3 +109,30 @@ def test_subscriptions_request_unified_prices_and_account_updates() -> None:
     assert websocket.messages[0]["params"]["use_yes_price"] is True
     assert websocket.messages[0]["params"]["channels"] == ["orderbook_delta"]
     assert "fill" in websocket.messages[2]["params"]["channels"]
+
+
+class CredentialClient:
+    has_credentials = True
+
+
+def test_rfq_subscription_uses_communications_channel_and_optional_shard() -> None:
+    websocket = FakeWebSocket()
+    stream = KalshiRFQWebSocket(
+        CredentialClient(),  # type: ignore[arg-type]
+        shard_factor=4,
+        shard_key=2,
+    )
+
+    asyncio.run(stream._subscribe(websocket))
+
+    assert websocket.messages == [
+        {
+            "id": 1,
+            "cmd": "subscribe",
+            "params": {
+                "channels": ["communications"],
+                "shard_factor": 4,
+                "shard_key": 2,
+            },
+        }
+    ]

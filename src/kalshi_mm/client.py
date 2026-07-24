@@ -266,6 +266,72 @@ class KalshiClient:
             authenticated=True,
         ).get("fills", [])
 
+    def create_rfq_quote(
+        self,
+        *,
+        rfq_id: str,
+        yes_bid: str,
+        no_bid: str,
+        rest_remainder: bool = False,
+        post_only: bool = True,
+        subaccount: int = 0,
+    ) -> str:
+        data = self._request(
+            "POST",
+            "/communications/quotes",
+            json={
+                "rfq_id": rfq_id,
+                "yes_bid": yes_bid,
+                "no_bid": no_bid,
+                "rest_remainder": rest_remainder,
+                "post_only": post_only,
+                "subaccount": subaccount,
+            },
+            authenticated=True,
+        )
+        quote_id = str(data.get("id", ""))
+        if not quote_id:
+            raise KalshiAPIError(201, "POST", "/communications/quotes", "missing quote id")
+        return quote_id
+
+    def get_rfq_quotes(
+        self,
+        *,
+        status: str | None = None,
+        rfq_id: str | None = None,
+        user_filter: str = "self",
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {
+            "user_filter": user_filter,
+            "limit": min(max(limit, 1), 500),
+        }
+        if status:
+            params["status"] = status
+        if rfq_id:
+            params["rfq_id"] = rfq_id
+        return self._request(
+            "GET",
+            "/communications/quotes",
+            params=params,
+            authenticated=True,
+        ).get("quotes", [])
+
+    def delete_rfq_quote(self, rfq_id: str, quote_id: str) -> None:
+        self._request(
+            "DELETE",
+            f"/communications/rfqs/{rfq_id}/quotes/{quote_id}",
+            authenticated=True,
+        )
+
+    def confirm_rfq_quote(self, rfq_id: str, quote_id: str) -> None:
+        self._request(
+            "PUT",
+            f"/communications/rfqs/{rfq_id}/quotes/{quote_id}/confirm",
+            json={},
+            authenticated=True,
+        )
+
     def create_order(
         self,
         *,

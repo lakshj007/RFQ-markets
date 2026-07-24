@@ -189,3 +189,71 @@ class KalshiWebSocket:
             except (ConnectionClosed, OSError, SequenceGapError):
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, self.reconnect_max_seconds)
+
+
+class KalshiRFQWebSocket:
+    """Authenticated, reconnecting stream for Kalshi's communications channel."""
+
+    def __init__(
+        self,
+        client: KalshiClient,
+        *,
+        demo: bool = False,
+        reconnect_max_seconds: float = 15,
+        shard_factor: int | None = None,
+        shard_key: int | None = None,
+    ) -> None:
+        if not client.has_credentials:
+            raise ValueError(
+                "Kalshi RFQ WebSocket requires an API key ID and private key path"
+            )
+        if (shard_factor is None) != (shard_key is None):
+            raise ValueError("shard_factor and shard_key must be supplied together")
+        if shard_factor is not None:
+            if not 1 <= shard_factor <= 100:
+                raise ValueError("shard_factor must be between 1 and 100")
+            assert shard_key is not None
+            if not 0 <= shard_key < shard_factor:
+                raise ValueError("shard_key must be in [0, shard_factor)")
+        self.client = client
+        self.url = DEMO_WS_URL if demo else PRODUCTION_WS_URL
+        self.reconnect_max_seconds = reconnect_max_seconds
+        self.shard_factor = shard_factor
+        self.shard_key = shard_key
+
+    async def _subscribe(self, websocket: Any) -> None:
+        params: dict[str, Any] = {"channels": ["communications"]}
+        if self.shard_factor is not None:
+            params["shard_factor"] = self.shard_factor
+            params["shard_key"] = self.shard_key
+        await websocket.send(
+            json.dumps({"id": 1, "cmd": "subscribe", "params": params})
+        )
+
+    async def events(self) -> AsyncIterator[dict[str, Any]]:
+        backoff = 1.0
+        while True:
+            try:
+                async with websockets.connect(
+                    self.url,
+                    additional_headers=self.client.websocket_headers(),
+                    ping_interval=20,
+                    ping_timeout=20,
+                    max_queue=4096,
+                ) as websocket:
+                    await self._subscribe(websocket)
+                    backoff = 1.0
+                    async for raw_message in websocket:
+                        message = json.loads(raw_message)
+                        if not isinstance(message, dict):
+                            continue
+                        if message.get("type") == "error":
+                            raise RuntimeError(
+                                f"Kalshi WebSocket error: {message.get('msg')}"
+                            )
+                        yield message
+            except asyncio.CancelledError:
+                raise
+            except (ConnectionClosed, OSError, json.JSONDecodeError):
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, self.reconnect_max_seconds)

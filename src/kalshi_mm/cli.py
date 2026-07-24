@@ -43,9 +43,17 @@ from .maker_paper import MakerPaperRecorder, MakerPaperUpdate
 from .models import Level, OrderBook, PriceGrid, as_decimal
 from .odds import DEFAULT_SHARP_BOOKMAKERS, OddsClient
 from .paper import PaperRecorder
+from .rfq import (
+    RFQ_LIVE_ACKNOWLEDGEMENT,
+    RFQ_LIVE_ENABLE_TOKEN,
+    JsonMoneylineFairBook,
+    OddsMoneylineFairBook,
+    RFQMaker,
+    RFQMakerConfig,
+)
 from .scanner import Discrepancy, scan_discrepancies
 from .strategy import MarketMakerStrategy, StrategyConfig, devig_two_way
-from .ws import KalshiWebSocket, StreamUpdate
+from .ws import KalshiRFQWebSocket, KalshiWebSocket, StreamUpdate
 
 
 def _decimal(value: str) -> Decimal:
@@ -1014,6 +1022,130 @@ def _cmd_live_cancel(args: argparse.Namespace) -> None:
         print(f"Audit log: {args.audit_log}")
 
 
+class _RFQAudit:
+    def __init__(self, path: Path, *, json_output: bool) -> None:
+        self.log = LiveAuditLog(path)
+        self.json_output = json_output
+
+    def append(self, event: str, payload: dict[str, object]) -> None:
+        self.log.append(event, payload)
+        if self.json_output:
+            print(json.dumps({"event": event, **payload}), flush=True)
+            return
+        if event in {
+            "rfq_quote_dry_run",
+            "rfq_quote_submitted",
+            "rfq_quote_confirmed",
+            "rfq_quote_executed",
+            "rfq_quote_ambiguous",
+            "rfq_quote_skipped",
+            "rfq_confirmation_withheld",
+        }:
+            ticker = payload.get("ticker", "-")
+            rfq_id = payload.get("rfq_id", "-")
+            detail = payload.get("reason") or (
+                f"YES {payload.get('yes_bid', '-')} / NO {payload.get('no_bid', '-')}"
+            )
+            print(f"{event}: {ticker} {rfq_id} — {detail}", flush=True)
+
+
+def _rfq_client(args: argparse.Namespace) -> tuple[KalshiClient, bool, bool]:
+    if args.execute_demo and args.execute_live:
+        raise ValueError("choose at most one of --execute-demo and --execute-live")
+    if args.execute_demo:
+        if args.acknowledge_risk != "DEMO_ONLY":
+            raise ValueError("--execute-demo requires --acknowledge-risk DEMO_ONLY")
+        client = KalshiClient.from_env(demo=True)
+        return client, True, True
+    if args.execute_live:
+        if args.acknowledge_risk != RFQ_LIVE_ACKNOWLEDGEMENT:
+            raise ValueError(
+                "--execute-live requires --acknowledge-risk "
+                f"{RFQ_LIVE_ACKNOWLEDGEMENT}"
+            )
+        if os.getenv("KALSHI_RFQ_LIVE_ENABLED") != RFQ_LIVE_ENABLE_TOKEN:
+            raise ValueError(
+                "set KALSHI_RFQ_LIVE_ENABLED=I_UNDERSTAND_RFQ_REAL_MONEY "
+                "for production RFQ execution"
+            )
+        if not args.allow_ticker:
+            raise ValueError("production RFQ execution requires at least one --allow-ticker")
+        return _production_client(), False, True
+    if args.demo:
+        return KalshiClient.from_env(demo=True), True, False
+    return _production_client(), False, False
+
+
+def _cmd_rfq_maker(args: argparse.Namespace) -> None:
+    client, demo, execute = _rfq_client(args)
+    if not client.has_credentials:
+        raise ValueError("RFQ WebSocket access requires Kalshi API credentials")
+    fair_choices = sum((args.fair_file is not None, args.odds_sport is not None))
+    if fair_choices != 1:
+        raise ValueError("choose exactly one RFQ fair source: --fair-file or --odds-sport")
+    if args.fair_file is not None:
+        fair_book = JsonMoneylineFairBook(
+            args.fair_file,
+            refresh_seconds=args.fair_file_refresh,
+        )
+    else:
+        if demo:
+            raise ValueError("Odds API moneylines cannot safely map to Kalshi demo markets")
+        if not args.series:
+            raise ValueError("--odds-sport requires --series")
+        fair_book = OddsMoneylineFairBook(
+            kalshi=client,
+            odds=OddsClient.from_env(),
+            series_ticker=args.series,
+            sport=args.odds_sport,
+            regions=args.odds_regions,
+            bookmakers=args.odds_bookmakers,
+            min_bookmakers=max(2, args.odds_min_bookmakers),
+            max_source_age_seconds=args.odds_max_age,
+            match_window_hours=args.odds_match_window_hours,
+            refresh_seconds=args.odds_refresh,
+        )
+    maker = RFQMaker(
+        client=client,
+        stream=KalshiRFQWebSocket(
+            client,
+            demo=demo,
+            shard_factor=args.shard_factor,
+            shard_key=args.shard_key,
+        ),
+        fair_book=fair_book,
+        config=RFQMakerConfig(
+            edge_rate=args.edge_percent / Decimal("100"),
+            min_contracts=args.min_contracts,
+            max_contracts=args.max_contracts,
+            max_abs_position=args.max_position,
+            max_notional=args.max_notional,
+            max_active_quotes=args.max_active_quotes,
+            max_fair_age_seconds=args.max_fair_age,
+            reconcile_seconds=args.reconcile_seconds,
+            subaccount=args.subaccount,
+            allow_live_games=args.allow_live,
+        ),
+        audit_log=_RFQAudit(args.audit_log, json_output=args.json),
+        execute=execute,
+        allowed_tickers=set(args.allow_ticker or ()),
+    )
+    mode = (
+        "production execution"
+        if args.execute_live
+        else "demo execution"
+        if execute
+        else "dry run"
+    )
+    if not args.json:
+        print(
+            f"Starting moneyline RFQ maker ({mode}); minimum edge "
+            f"{args.edge_percent}% of fair value. Audit: {args.audit_log}",
+            flush=True,
+        )
+    asyncio.run(maker.run(seconds=args.seconds, max_messages=args.messages))
+
+
 def _format_stream_update(update: StreamUpdate, ticker: str) -> str | None:
     message = update.message
     message_type = str(message.get("type", ""))
@@ -1314,6 +1446,51 @@ def build_parser() -> argparse.ArgumentParser:
     live_cancel.add_argument("--audit-log", type=Path, default=Path("logs/live-orders.jsonl"))
     live_cancel.add_argument("--json", action="store_true")
     live_cancel.set_defaults(func=_cmd_live_cancel)
+
+    rfq = subparsers.add_parser(
+        "rfq-maker",
+        help="quote two-way moneyline RFQs from a fresh external fair value",
+    )
+    fair = rfq.add_argument_group("fair-value cache")
+    fair.add_argument("--fair-file", type=Path)
+    fair.add_argument("--fair-file-refresh", type=float, default=0.25)
+    fair.add_argument("--series", help="Kalshi moneyline series, used with --odds-sport")
+    fair.add_argument("--odds-sport", help="Odds API sport key, e.g. baseball_mlb")
+    fair.add_argument("--odds-regions", default="us")
+    fair.add_argument("--odds-bookmakers", default=DEFAULT_SHARP_BOOKMAKERS)
+    fair.add_argument("--odds-min-bookmakers", type=int, default=2)
+    fair.add_argument("--odds-max-age", type=float, default=60)
+    fair.add_argument("--odds-refresh", type=float, default=30)
+    fair.add_argument("--odds-match-window-hours", type=float, default=6)
+    pricing = rfq.add_argument_group("pricing and risk")
+    pricing.add_argument("--allow-ticker", action="append", default=[])
+    pricing.add_argument("--edge-percent", type=_decimal, default=Decimal("2"))
+    pricing.add_argument("--min-contracts", type=_decimal, default=Decimal("1"))
+    pricing.add_argument("--max-contracts", type=_decimal, default=Decimal("1"))
+    pricing.add_argument("--max-position", type=_decimal, default=Decimal("10"))
+    pricing.add_argument("--max-notional", type=_decimal, default=Decimal("10"))
+    pricing.add_argument("--max-active-quotes", type=int, default=20)
+    pricing.add_argument("--max-fair-age", type=float, default=60)
+    pricing.add_argument("--reconcile-seconds", type=float, default=15)
+    pricing.add_argument("--subaccount", type=int, default=0)
+    pricing.add_argument(
+        "--allow-live",
+        action="store_true",
+        help="explicitly allow in-play fair values; disabled by default",
+    )
+    transport = rfq.add_argument_group("WebSocket and process")
+    transport.add_argument("--demo", action="store_true", help="use demo RFQ data")
+    transport.add_argument("--shard-factor", type=int)
+    transport.add_argument("--shard-key", type=int)
+    transport.add_argument("--seconds", type=float, default=0, help="0 runs until interrupted")
+    transport.add_argument("--messages", type=int, default=0, help="0 means no message limit")
+    execution = rfq.add_argument_group("execution")
+    execution.add_argument("--execute-demo", action="store_true")
+    execution.add_argument("--execute-live", action="store_true")
+    execution.add_argument("--acknowledge-risk")
+    rfq.add_argument("--audit-log", type=Path, default=Path("logs/rfq-maker.jsonl"))
+    rfq.add_argument("--json", action="store_true")
+    rfq.set_defaults(func=_cmd_rfq_maker)
 
     stream = subparsers.add_parser("stream", help="watch Kalshi WebSocket updates")
     stream.add_argument("--ticker", required=True)
