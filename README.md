@@ -283,7 +283,12 @@ through Kalshi's execution timer, uses `post_only=true`, and never rests a remai
 It reconciles quote state and portfolio risk every 15 seconds, refuses to start over
 unresolved quotes from an earlier process, and cancels its unaccepted quotes on clean
 shutdown. Every decision and measured quote/confirmation latency is appended to
-`logs/rfq-maker.jsonl`.
+`logs/rfq-maker.jsonl`. Every observed execution is also appended idempotently to
+`RFQ_FILLS.md` by default; use `--fill-ledger PATH` to choose another Markdown file.
+Each row records the game/event, legs, accepted side, contracts, confirmation fair,
+quote price, proportional edge, modeled edge dollars, IDs, and fair source. REST
+reconciliation writes a missed execution too, so a dropped WebSocket execution message
+does not silently omit the fill.
 
 ### RFQ event workflow
 
@@ -306,6 +311,17 @@ shutdown. Every decision and measured quote/confirmation latency is appended to
 
 The initial scope intentionally rejects combo RFQs and `target_cost_dollars` RFQs. It
 quotes only `contracts_fp` requests for explicitly cached two-outcome moneylines.
+
+Correlation checks are fail-closed. Every allowed market must resolve to a Kalshi
+`event_ticker`, and startup rejects a fair-value universe containing more than one
+market from the same event/game. The Odds API source deterministically retains one
+canonical Kalshi market per two-way game because that market's YES and NO bids already
+cover both moneyline outcomes. It also loads every sibling market in that event and
+refuses to quote when the account already has a nonzero position in any sibling. Combo
+and MVE RFQs remain unsupported, so the maker never prices a multi-leg request. These
+guards enforce structural same-game separation; they do not claim that markets from
+different events are statistically independent when they share broader team, weather,
+season, or tournament risk.
 
 ## Guarded production order
 
@@ -348,7 +364,7 @@ The preview and execution both reject the order unless the market is active and 
 least five minutes pregame, the book is two-sided and no wider than 15 cents, the
 price is tick-valid and post-only, a public trade occurred within 15 minutes, recent
 volume is sufficient, the price joins or improves the current best level, no more than
-500 contracts are ahead at the same price, and a bid has at least two cents of modeled
+500 contracts are ahead at the same price, and a bid has at least one cent of modeled
 edge. Sharp-book prices must be no more than 60 seconds old. Execution also requires
 sufficient balance, no existing resting production orders, and compliance with the
 one-contract position limit.
@@ -395,9 +411,9 @@ reconciles by client order ID and cancels any recovered resting order.
 Sportsbook-backed YES entries can opt into a bounded fair-value monitor. The original
 post-only order remains at its submitted price; the monitor can only leave it alone or
 cancel it, never amend, replace, or submit a second entry. The preview shows the initial
-fair and edge, the exact cancellation threshold (entry price plus the hard two-cent
-edge), poll interval, maximum resting duration, odds staleness limit, API failure grace,
-and any attached bounded exit:
+fair and edge, the exact cancellation threshold (entry price plus the configured live
+minimum edge; one cent by default), poll interval, maximum resting duration, odds
+staleness limit, API failure grace, and any attached bounded exit:
 
 ```bash
 kalshi-mm live-order \
@@ -483,7 +499,7 @@ kalshi-mm live-order \
 ```
 
 Asks are reduce-only and require an existing YES position. A risk-reducing exit may
-execute without the two-cent entry edge requirement. If a process crashes or an order
+execute without the one-cent entry edge requirement. If a process crashes or an order
 needs manual recovery, inspect and cancel it explicitly:
 
 ```bash
@@ -519,6 +535,11 @@ kalshi-mm scan \
   --min-edge-cents 3 \
   --show-all
 ```
+
+For tight, active books, `MAKE BID` means the current ask is not cheap enough to take,
+but the resting YES bid is below sportsbook fair by the configured edge. This is the
+mode intended for high-volume one-cent-spread markets: join or improve the bid
+post-only, rather than requiring a wide spread or crossing the ask.
 
 Add `--show-all` to inspect every safely matched market, including markets without an
 actionable edge. The scan displays remaining Odds API quota and the cost of the last

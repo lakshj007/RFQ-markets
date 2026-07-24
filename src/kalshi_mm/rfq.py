@@ -7,7 +7,7 @@ import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -20,6 +20,7 @@ from .scanner import consensus_probability
 RFQ_LIVE_ENABLE_TOKEN = "I_UNDERSTAND_RFQ_REAL_MONEY"
 RFQ_LIVE_ACKNOWLEDGEMENT = "REAL_MONEY_RFQ_AUTOCONFIRM"
 HARD_MIN_RFQ_EDGE_RATE = Decimal("0.02")
+UNSUPPORTED_AUDIT_BATCH_SIZE = 1_000
 
 
 def _parse_time(value: object, *, field: str) -> datetime:
@@ -197,6 +198,7 @@ class OddsMoneylineFairBook:
         )
         refreshed: dict[str, MoneylineFair] = {}
         for match in matches:
+            event_fairs: list[MoneylineFair] = []
             for market in match.kalshi_event.get("markets", []):
                 ticker = str(market.get("ticker", ""))
                 outcome = str(market.get("yes_sub_title", ""))
@@ -224,7 +226,14 @@ class OddsMoneylineFairBook:
                     source="odds-consensus:" + ",".join(consensus.bookmaker_keys),
                 )
                 fair.validate()
-                refreshed[ticker] = fair
+                event_fairs.append(fair)
+            # Kalshi can expose each team in a two-way game as a separate binary
+            # market. Quoting one market's YES and NO sides already covers both
+            # outcomes, so retain one stable representative and avoid correlated
+            # simultaneous quotes on sibling markets from the same game.
+            if event_fairs:
+                canonical = min(event_fairs, key=lambda item: item.ticker)
+                refreshed[canonical.ticker] = canonical
         if not refreshed:
             raise ValueError("no fresh, safely matched two-way moneyline fairs were found")
         self._values = refreshed
@@ -334,8 +343,8 @@ def price_moneyline_rfq(
         if bid <= ZERO:
             return ZERO, None
         modeled_edge_rate = (outcome_fair - bid) / outcome_fair
-        if modeled_edge_rate < HARD_MIN_RFQ_EDGE_RATE:
-            raise ValueError("price-grid rounding violated the proportional RFQ edge floor")
+        if modeled_edge_rate < edge_rate:
+            raise ValueError("price-grid rounding violated the configured RFQ edge")
         return bid, modeled_edge_rate
 
     yes_bid, yes_edge_rate = bid_for(fair.probability)
@@ -391,6 +400,77 @@ class QuoteReservation:
     quote_id: str
     accepted_side: str | None = None
     accepted_contracts: Decimal = ZERO
+    confirmed_outcome_fair: Decimal | None = None
+    confirmed_edge_rate: Decimal | None = None
+
+
+class MarkdownRFQFillLedger:
+    """Append an idempotent, human-readable record for every observed RFQ execution."""
+
+    HEADER = (
+        "# RFQ Fill Ledger\n\n"
+        "This file is updated when the maker observes an executed RFQ. Edge is the modeled\n"
+        "pre-fee edge at confirmation when available, otherwise the quote-time edge. "
+        "Combo/MVE\nRFQs are currently rejected, so current fills are single-leg moneylines "
+        "rather than\nparlays. The `Structure` and `Legs` columns are retained for an explicit "
+        "future parlay\nimplementation.\n\n"
+        "| Executed (UTC) | Structure | Event/game | Legs | Side | Contracts | Fair | Quote | "
+        "Edge | Edge/contract | Total modeled edge | RFQ | Quote | Order | Source |\n"
+        "| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | "
+        "--- | --- | --- |\n"
+    )
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+
+    @staticmethod
+    def _cell(value: object) -> str:
+        return str(value).replace("|", "\\|").replace("\n", " ").strip()
+
+    def append(
+        self,
+        reservation: QuoteReservation,
+        *,
+        event_ticker: str,
+        execution: dict[str, Any],
+    ) -> bool:
+        side = reservation.accepted_side
+        contracts = reservation.accepted_contracts
+        if side not in {"yes", "no"} or contracts <= ZERO:
+            raise ValueError("executed RFQ is missing its accepted side or contract count")
+        plan = reservation.plan
+        quote_price = plan.yes_bid if side == "yes" else plan.no_bid
+        quote_time_fair = plan.fair.probability if side == "yes" else ONE - plan.fair.probability
+        outcome_fair = reservation.confirmed_outcome_fair or quote_time_fair
+        edge_rate = reservation.confirmed_edge_rate or (
+            (outcome_fair - quote_price) / outcome_fair
+        )
+        edge_per_contract = outcome_fair - quote_price
+        total_edge = edge_per_contract * contracts
+        quote_id = reservation.quote_id
+        marker = f"<!-- kalshi-rfq-fill:{quote_id} -->"
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.path.exists():
+            current = self.path.read_text(encoding="utf-8")
+        else:
+            current = self.HEADER
+            self.path.write_text(current, encoding="utf-8")
+        if marker in current:
+            return False
+        executed_at = execution.get("executed_ts") or datetime.now(UTC).isoformat()
+        order_id = execution.get("order_id") or execution.get("creator_order_id") or "-"
+        legs = f"`{plan.request.ticker}` {side.upper()}"
+        row = (
+            f"| {self._cell(executed_at)} | Single moneyline | "
+            f"{self._cell(event_ticker)} | {legs} | {side.upper()} | {contracts} | "
+            f"${outcome_fair:.4f} | ${quote_price:.4f} | {edge_rate:.4%} | "
+            f"${edge_per_contract:.4f} | ${total_edge:.4f} | "
+            f"{self._cell(plan.request.rfq_id)} | {self._cell(quote_id)} {marker} | "
+            f"{self._cell(order_id)} | {self._cell(plan.fair.source)} |\n"
+        )
+        with self.path.open("a", encoding="utf-8") as output:
+            output.write(row)
+        return True
 
 
 class RFQRiskLedger:
@@ -506,6 +586,7 @@ class RFQMaker:
         config: RFQMakerConfig,
         audit_log: AuditLog,
         execute: bool,
+        fill_ledger: MarkdownRFQFillLedger | None = None,
         allowed_tickers: set[str] | None = None,
     ) -> None:
         config.validate()
@@ -514,17 +595,121 @@ class RFQMaker:
         self.fair_book = fair_book
         self.config = config
         self.audit_log = audit_log
+        self.fill_ledger = fill_ledger
         self.execute = execute
         self.allowed_tickers = set(allowed_tickers or ())
         self.price_grids: dict[str, PriceGrid] = {}
+        self.event_tickers: dict[str, str] = {}
+        self.event_markets: dict[str, tuple[str, ...]] = {}
         self.ledger = RFQRiskLedger(config)
         self.closed_rfqs: set[str] = set()
         self._lock = asyncio.Lock()
         self._tasks: set[asyncio.Task[None]] = set()
         self._rfq_tails: dict[str, asyncio.Task[None]] = {}
+        self._unsupported_counts: dict[str, int] = {}
 
     def _audit(self, event: str, payload: dict[str, object]) -> None:
         self.audit_log.append(event, payload)
+
+    def _flush_unsupported_summary(self) -> None:
+        if not self._unsupported_counts:
+            return
+        counts = dict(sorted(self._unsupported_counts.items()))
+        self._unsupported_counts.clear()
+        self._audit(
+            "rfq_unsupported_summary",
+            {
+                "messages": sum(counts.values()),
+                "reasons": counts,
+                "risk_reserved": False,
+            },
+        )
+
+    def _record_unsupported(self, reason: str) -> None:
+        self._unsupported_counts[reason] = self._unsupported_counts.get(reason, 0) + 1
+        if sum(self._unsupported_counts.values()) >= UNSUPPORTED_AUDIT_BATCH_SIZE:
+            self._flush_unsupported_summary()
+
+    def _prefilter_created(self, message: dict[str, Any]) -> str | None:
+        payload = message.get("msg")
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("mve_collection_ticker") or payload.get("mve_selected_legs"):
+            return "combo RFQs are not supported by the moneyline maker"
+        contracts_raw = payload.get("contracts_fp")
+        try:
+            target_cost = as_decimal(payload.get("target_cost_dollars") or "0")
+        except (InvalidOperation, TypeError, ValueError):
+            return None
+        if contracts_raw in {None, ""} or target_cost > ZERO:
+            return "only contracts_fp RFQs are supported"
+        ticker = str(payload.get("market_ticker", ""))
+        if ticker and not self._ticker_allowed(ticker):
+            return "ticker is not on the moneyline allowlist"
+        return None
+
+    def _record_fill(
+        self,
+        reservation: QuoteReservation,
+        execution: dict[str, Any],
+        *,
+        reconciled: bool = False,
+    ) -> None:
+        plan = reservation.plan
+        side = reservation.accepted_side
+        outcome_fair = reservation.confirmed_outcome_fair
+        if outcome_fair is None and side in {"yes", "no"}:
+            outcome_fair = plan.fair.probability if side == "yes" else ONE - plan.fair.probability
+        quoted_price = (
+            plan.yes_bid
+            if side == "yes"
+            else plan.no_bid
+            if side == "no"
+            else None
+        )
+        edge_rate = reservation.confirmed_edge_rate
+        if edge_rate is None and outcome_fair and quoted_price is not None:
+            edge_rate = (outcome_fair - quoted_price) / outcome_fair
+        payload: dict[str, object] = {
+            "rfq_id": plan.request.rfq_id,
+            "quote_id": reservation.quote_id,
+            "ticker": plan.request.ticker,
+            "event_ticker": self.event_tickers.get(plan.request.ticker, ""),
+            "structure": "single_moneyline",
+            "legs": [f"{plan.request.ticker}:{side or 'unknown'}"],
+            "accepted_side": side,
+            "contracts_fp": str(reservation.accepted_contracts),
+            "outcome_fair": str(outcome_fair) if outcome_fair is not None else None,
+            "quoted_price": str(quoted_price) if quoted_price is not None else None,
+            "edge_rate": str(edge_rate) if edge_rate is not None else None,
+            "edge_dollars": (
+                str(outcome_fair - quoted_price)
+                if outcome_fair is not None and quoted_price is not None
+                else None
+            ),
+            "order_id": str(
+                execution.get("order_id") or execution.get("creator_order_id") or ""
+            ),
+            "executed_ts": str(execution.get("executed_ts") or ""),
+            "reconciled": reconciled,
+        }
+        if self.fill_ledger is not None:
+            try:
+                self.fill_ledger.append(
+                    reservation,
+                    event_ticker=self.event_tickers.get(plan.request.ticker, ""),
+                    execution=execution,
+                )
+            except Exception as exc:
+                self._audit(
+                    "rfq_fill_ledger_failed",
+                    {
+                        "rfq_id": plan.request.rfq_id,
+                        "quote_id": reservation.quote_id,
+                        "reason": str(exc),
+                    },
+                )
+        self._audit("rfq_quote_executed", payload)
 
     def _fair(self, ticker: str, *, now: datetime | None = None) -> MoneylineFair:
         fair = self.fair_book.get(ticker)
@@ -547,19 +732,78 @@ class RFQMaker:
         existing = self.price_grids.get(ticker)
         if existing is not None:
             return existing
-        market, position = await asyncio.gather(
-            asyncio.to_thread(self.client.get_market, ticker),
+        market = await asyncio.to_thread(self.client.get_market, ticker)
+        if str(market.get("status", "")) not in {"active", "open"}:
+            raise ValueError("market is not active")
+        event_ticker = str(market.get("event_ticker", "")).strip()
+        if not event_ticker:
+            raise ValueError("market is missing an event ticker required for correlation checks")
+        event, position = await asyncio.gather(
+            asyncio.to_thread(self.client.get_event, event_ticker),
             asyncio.to_thread(
                 self.client.get_position,
                 ticker,
                 subaccount=self.config.subaccount,
             ),
         )
-        if str(market.get("status", "")) not in {"active", "open"}:
-            raise ValueError("market is not active")
+        event_market_tickers = tuple(
+            sorted(
+                {
+                    str(item.get("ticker", "")).strip()
+                    for item in event.get("markets", [])
+                    if isinstance(item, dict) and str(item.get("ticker", "")).strip()
+                }
+                | {ticker}
+            )
+        )
+        sibling_tickers = tuple(item for item in event_market_tickers if item != ticker)
+        if sibling_tickers:
+            sibling_positions = await asyncio.gather(
+                *(
+                    asyncio.to_thread(
+                        self.client.get_position,
+                        sibling,
+                        subaccount=self.config.subaccount,
+                    )
+                    for sibling in sibling_tickers
+                )
+            )
+            correlated_positions = {
+                sibling: as_decimal(sibling_position)
+                for sibling, sibling_position in zip(
+                    sibling_tickers,
+                    sibling_positions,
+                    strict=True,
+                )
+                if as_decimal(sibling_position) != ZERO
+            }
+            if correlated_positions:
+                detail = ", ".join(
+                    f"{sibling}={sibling_position}"
+                    for sibling, sibling_position in sorted(correlated_positions.items())
+                )
+                raise ValueError(
+                    "existing position in a correlated same-event market blocks RFQ "
+                    f"quoting: {detail}"
+                )
         grid = PriceGrid.from_market(market)
         async with self._lock:
+            same_event_ticker = next(
+                (
+                    other_ticker
+                    for other_ticker, other_event in self.event_tickers.items()
+                    if other_event == event_ticker and other_ticker != ticker
+                ),
+                None,
+            )
+            if same_event_ticker is not None:
+                raise ValueError(
+                    "correlated quote universe contains multiple markets from event "
+                    f"{event_ticker}: {same_event_ticker}, {ticker}"
+                )
             self.price_grids[ticker] = grid
+            self.event_tickers[ticker] = event_ticker
+            self.event_markets[event_ticker] = event_market_tickers
             self.ledger.positions[ticker] = as_decimal(position)
         return grid
 
@@ -600,6 +844,9 @@ class RFQMaker:
             {
                 "execute": self.execute,
                 "tickers": list(selected),
+                "event_tickers": {
+                    ticker: self.event_tickers[ticker] for ticker in selected
+                },
                 "edge_rate": str(self.config.edge_rate),
                 "max_fair_age_seconds": self.config.max_fair_age_seconds,
                 "available_balance": str(self.ledger.available_balance),
@@ -724,19 +971,9 @@ class RFQMaker:
                 reservation.accepted_side = side
                 reservation.accepted_contracts = count
             await asyncio.to_thread(self.client.confirm_rfq_quote, rfq_id, quote_id)
-            elapsed_ms = (time.monotonic() - received_at) * 1000
-            self._audit(
-                "rfq_quote_confirmed",
-                {
-                    "rfq_id": rfq_id,
-                    "quote_id": quote_id,
-                    "ticker": reservation.plan.request.ticker,
-                    "accepted_side": side,
-                    "contracts_fp": str(count),
-                    "current_edge_rate": str(current_edge_rate),
-                    "latency_ms": round(elapsed_ms, 3),
-                },
-            )
+            async with self._lock:
+                reservation.confirmed_outcome_fair = outcome_fair
+                reservation.confirmed_edge_rate = current_edge_rate
         except Exception as exc:
             if isinstance(exc, KalshiAPIError) and 400 <= exc.status_code < 500:
                 async with self._lock:
@@ -748,6 +985,21 @@ class RFQMaker:
                 "rfq_confirmation_withheld",
                 {"rfq_id": rfq_id, "quote_id": quote_id, "reason": str(exc)},
             )
+            return
+        elapsed_ms = (time.monotonic() - received_at) * 1000
+        self._audit(
+            "rfq_quote_confirmed",
+            {
+                "rfq_id": rfq_id,
+                "quote_id": quote_id,
+                "ticker": reservation.plan.request.ticker,
+                "accepted_side": side,
+                "contracts_fp": str(count),
+                "current_outcome_fair": str(outcome_fair),
+                "current_edge_rate": str(current_edge_rate),
+                "latency_ms": round(elapsed_ms, 3),
+            },
+        )
 
     async def _deleted(self, message: dict[str, Any]) -> None:
         payload = message.get("msg")
@@ -784,17 +1036,7 @@ class RFQMaker:
             if reservation is not None:
                 self.ledger.record_execution(reservation)
         if reservation is not None:
-            self._audit(
-                "rfq_quote_executed",
-                {
-                    "rfq_id": rfq_id,
-                    "quote_id": reservation.quote_id,
-                    "ticker": reservation.plan.request.ticker,
-                    "accepted_side": reservation.accepted_side,
-                    "contracts_fp": str(reservation.accepted_contracts),
-                    "order_id": str(payload.get("order_id", "")),
-                },
-            )
+            self._record_fill(reservation, payload)
 
     async def handle(self, message: dict[str, Any], *, received_at: float | None = None) -> None:
         received_at = received_at or time.monotonic()
@@ -842,7 +1084,7 @@ class RFQMaker:
             and not item.get("cancelled_ts")
         }
         reconciled_tickers: set[str] = set()
-        released: list[tuple[str, str, str]] = []
+        released: list[tuple[str, QuoteReservation, dict[str, Any], str, bool]] = []
         async with self._lock:
             for rfq_id, reservation in tuple(self.ledger.reservations.items()):
                 quote = by_id.get(reservation.quote_id)
@@ -864,9 +1106,13 @@ class RFQMaker:
                 )
                 if terminal:
                     self.ledger.release(rfq_id)
+                    executed = bool(quote.get("executed_ts")) or status == "executed"
+                    if executed:
+                        self.ledger.record_execution(reservation)
                     ticker = reservation.plan.request.ticker
                     reconciled_tickers.add(ticker)
-                    released.append((rfq_id, reservation.quote_id, status or "terminal"))
+                    final_status = "executed" if executed else status or "terminal"
+                    released.append((rfq_id, reservation, quote, final_status, executed))
         if reconciled_tickers:
             positions = await asyncio.gather(
                 *(
@@ -891,10 +1137,16 @@ class RFQMaker:
                     }
                 )
                 self.ledger.available_balance = available
-        for rfq_id, quote_id, status in released:
+        for rfq_id, reservation, quote, status, executed in released:
+            if executed:
+                self._record_fill(reservation, quote, reconciled=True)
             self._audit(
                 "rfq_quote_reconciled",
-                {"rfq_id": rfq_id, "quote_id": quote_id, "status": status},
+                {
+                    "rfq_id": rfq_id,
+                    "quote_id": reservation.quote_id,
+                    "status": status,
+                },
             )
 
     async def _reconcile_quotes(self) -> None:
@@ -969,7 +1221,8 @@ class RFQMaker:
     async def _consume(self, *, max_messages: int = 0) -> None:
         seen = 0
         async for message in self.stream.events():
-            if message.get("type") not in {
+            message_type = message.get("type")
+            if message_type not in {
                 "rfq_created",
                 "rfq_deleted",
                 "quote_accepted",
@@ -983,6 +1236,21 @@ class RFQMaker:
                 or payload.get("id")
                 or f"unkeyed:{seen}"
             )
+            seen += 1
+            if message_type == "rfq_created":
+                rejection = self._prefilter_created(message)
+                if rejection is not None:
+                    self._record_unsupported(rejection)
+                    if max_messages and seen >= max_messages:
+                        return
+                    continue
+            elif (
+                rfq_id not in self._rfq_tails
+                and rfq_id not in self.ledger.reservations
+            ):
+                if max_messages and seen >= max_messages:
+                    return
+                continue
             prior = self._rfq_tails.get(rfq_id)
             received_at = time.monotonic()
 
@@ -1006,7 +1274,6 @@ class RFQMaker:
                     self._rfq_tails.pop(key, None)
 
             task.add_done_callback(completed)
-            seen += 1
             if max_messages and seen >= max_messages:
                 return
 
@@ -1034,4 +1301,5 @@ class RFQMaker:
             )
             if self._tasks:
                 await asyncio.gather(*self._tasks, return_exceptions=True)
+            self._flush_unsupported_summary()
             await self.shutdown()

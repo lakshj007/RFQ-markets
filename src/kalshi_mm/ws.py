@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import ssl
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
 
+import certifi
 import websockets
 from websockets.exceptions import ConnectionClosed
 
@@ -15,6 +17,11 @@ from .models import Level, OrderBook, as_decimal
 
 PRODUCTION_WS_URL = "wss://external-api-ws.kalshi.com/trade-api/ws/v2"
 DEMO_WS_URL = "wss://external-api-ws.demo.kalshi.co/trade-api/ws/v2"
+
+
+def websocket_ssl_context() -> ssl.SSLContext:
+    """Use Requests' maintained CA bundle for consistent TLS verification."""
+    return ssl.create_default_context(cafile=certifi.where())
 
 
 class SequenceGapError(RuntimeError):
@@ -170,6 +177,7 @@ class KalshiWebSocket:
                 async with websockets.connect(
                     self.url,
                     additional_headers=self.client.websocket_headers(),
+                    ssl=websocket_ssl_context(),
                     ping_interval=20,
                     ping_timeout=20,
                     max_queue=4096,
@@ -237,6 +245,7 @@ class KalshiRFQWebSocket:
                 async with websockets.connect(
                     self.url,
                     additional_headers=self.client.websocket_headers(),
+                    ssl=websocket_ssl_context(),
                     ping_interval=20,
                     ping_timeout=20,
                     max_queue=4096,

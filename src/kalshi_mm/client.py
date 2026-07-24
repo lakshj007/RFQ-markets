@@ -96,11 +96,10 @@ class KalshiClient:
         self._private_key = loaded
         return loaded
 
-    def _auth_headers(self, method: str, path: str) -> dict[str, str]:
+    def _signed_headers(self, method: str, full_path: str) -> dict[str, str]:
         if not self.api_key_id:
             raise ValueError("KALSHI_API_KEY_ID is required for authenticated requests")
         timestamp_ms = str(int(time.time() * 1000))
-        full_path = urlparse(self.base_url + path).path
         return {
             "KALSHI-ACCESS-KEY": self.api_key_id,
             "KALSHI-ACCESS-TIMESTAMP": timestamp_ms,
@@ -109,9 +108,13 @@ class KalshiClient:
             ),
         }
 
+    def _auth_headers(self, method: str, path: str) -> dict[str, str]:
+        full_path = urlparse(self.base_url + path).path
+        return self._signed_headers(method, full_path)
+
     def websocket_headers(self) -> dict[str, str]:
         """Create authentication headers for the Trade API WebSocket handshake."""
-        return self._auth_headers("GET", "/trade-api/ws/v2")
+        return self._signed_headers("GET", "/trade-api/ws/v2")
 
     def _request(
         self,

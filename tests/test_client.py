@@ -19,6 +19,23 @@ def test_demo_client_uses_current_external_host() -> None:
     assert client.base_url == "https://external-api.demo.kalshi.co/trade-api/v2"
 
 
+def test_websocket_headers_sign_exact_websocket_path(monkeypatch) -> None:
+    signed_paths: list[str] = []
+    client = KalshiClient(api_key_id="key-id")
+
+    monkeypatch.setattr("kalshi_mm.client.time.time", lambda: 1_700_000_000)
+    monkeypatch.setattr(client, "_load_private_key", lambda: object())
+    monkeypatch.setattr(
+        "kalshi_mm.client.sign_request",
+        lambda _key, _timestamp, _method, path: signed_paths.append(path) or "signature",
+    )
+
+    headers = client.websocket_headers()
+
+    assert headers["KALSHI-ACCESS-SIGNATURE"] == "signature"
+    assert signed_paths == ["/trade-api/ws/v2"]
+
+
 def test_production_client_uses_separate_environment_variables(monkeypatch) -> None:
     monkeypatch.setenv("KALSHI_API_KEY_ID", "demo-key")
     monkeypatch.setenv("KALSHI_PRIVATE_KEY_PATH", "/tmp/demo.key")

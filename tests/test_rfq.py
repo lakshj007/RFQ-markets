@@ -3,19 +3,23 @@ import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
 from kalshi_mm.models import PriceGrid
 from kalshi_mm.rfq import (
     JsonMoneylineFairBook,
+    MarkdownRFQFillLedger,
     MoneylineFair,
+    OddsMoneylineFairBook,
     RFQMaker,
     RFQMakerConfig,
     RFQRequest,
     RFQRiskLedger,
     price_moneyline_rfq,
 )
+from kalshi_mm.scanner import ConsensusPrice
 
 
 def request(*, contracts: str = "1") -> RFQRequest:
@@ -146,6 +150,55 @@ def test_json_fair_book_requires_freshness_metadata(tmp_path) -> None:
     assert parsed.event_start == now + timedelta(hours=1)
 
 
+def test_odds_fair_book_keeps_one_canonical_market_per_event(monkeypatch) -> None:
+    now = datetime.now(UTC)
+    kalshi_event = {
+        "event_ticker": "GAME",
+        "markets": [
+            {"ticker": "GAME-B", "yes_sub_title": "Team B"},
+            {"ticker": "GAME-A", "yes_sub_title": "Team A"},
+        ],
+    }
+    odds_event = SimpleNamespace(commence_time=now + timedelta(hours=1))
+    match = SimpleNamespace(kalshi_event=kalshi_event, odds_event=odds_event)
+
+    class FakeKalshiEvents:
+        def get_events(self, **_kwargs) -> list[dict]:
+            return [kalshi_event]
+
+    class FakeOddsEvents:
+        def get_odds(self, *_args, **_kwargs) -> list[object]:
+            return [odds_event]
+
+    monkeypatch.setattr("kalshi_mm.rfq.match_events", lambda *_args, **_kwargs: [match])
+    monkeypatch.setattr(OddsMoneylineFairBook, "_is_two_way", staticmethod(lambda _event: True))
+    monkeypatch.setattr(
+        OddsMoneylineFairBook,
+        "_oldest_selected_update",
+        staticmethod(lambda _event, _selected: now),
+    )
+    monkeypatch.setattr(
+        "kalshi_mm.rfq.consensus_probability",
+        lambda _event, outcome, **_kwargs: ConsensusPrice(
+            fair_probability=Decimal("0.55") if outcome == "Team A" else Decimal("0.45"),
+            bookmaker_count=2,
+            minimum=Decimal("0.54"),
+            maximum=Decimal("0.56"),
+            bookmaker_keys=("book-a", "book-b"),
+        ),
+    )
+    book = OddsMoneylineFairBook(
+        kalshi=FakeKalshiEvents(),  # type: ignore[arg-type]
+        odds=FakeOddsEvents(),  # type: ignore[arg-type]
+        series_ticker="SERIES",
+        sport="sport",
+    )
+
+    assert book.refresh() == ("GAME-A",)
+    assert book.get("GAME-A") is not None
+    assert book.get("GAME-B") is None
+
+
 class FakeFairBook:
     refresh_seconds = 60.0
 
@@ -162,6 +215,22 @@ class FakeFairBook:
         return ("MARKET",)
 
 
+class MultiFairBook:
+    refresh_seconds = 60.0
+
+    def __init__(self, values: dict[str, MoneylineFair]) -> None:
+        self.values = values
+
+    def refresh(self) -> tuple[str, ...]:
+        return self.tickers()
+
+    def get(self, ticker: str) -> MoneylineFair | None:
+        return self.values.get(ticker)
+
+    def tickers(self) -> tuple[str, ...]:
+        return tuple(sorted(self.values))
+
+
 class EmptyStream:
     async def events(self):
         if False:
@@ -171,6 +240,23 @@ class EmptyStream:
 class OneMessageStream:
     async def events(self):
         yield created_message()
+
+
+class UnsupportedBurstStream:
+    async def events(self):
+        for index in range(2_500):
+            yield {
+                "type": "rfq_created",
+                "msg": {
+                    "id": f"combo-{index}",
+                    "market_ticker": f"COMBO-{index}",
+                    "contracts_fp": "1.00",
+                    "created_ts": datetime.now(UTC).isoformat(),
+                    "mve_collection_ticker": "COMBO-COLLECTION",
+                    "mve_selected_legs": [{"market_ticker": "LEG-1"}],
+                },
+            }
+            yield {"type": "rfq_deleted", "msg": {"id": f"combo-{index}"}}
 
 
 class RecordingAudit:
@@ -187,16 +273,30 @@ class FakeClient:
         self.confirmed: list[tuple[str, str]] = []
         self.deleted: list[tuple[str, str]] = []
         self.existing_quotes: list[dict] = []
+        self.market_events: dict[str, str] = {"MARKET": "EVENT-MARKET"}
+        self.event_markets: dict[str, tuple[str, ...]] = {
+            "EVENT-MARKET": ("MARKET",)
+        }
+        self.positions: dict[str, str] = {}
 
     def get_market(self, ticker: str) -> dict:
         return {
             "ticker": ticker,
+            "event_ticker": self.market_events[ticker],
             "status": "active",
             "price_ranges": [{"start": "0", "end": "1", "step": "0.01"}],
         }
 
+    def get_event(self, event_ticker: str) -> dict:
+        return {
+            "event_ticker": event_ticker,
+            "markets": [
+                {"ticker": ticker} for ticker in self.event_markets[event_ticker]
+            ],
+        }
+
     def get_position(self, ticker: str, *, subaccount: int = 0) -> str:
-        return "0"
+        return self.positions.get(ticker, "0")
 
     def get_balance(self, *, subaccount: int = 0) -> dict:
         return {"balance": 10_000}
@@ -238,6 +338,53 @@ def accepted_message() -> dict:
             "contracts_accepted_fp": "1.00",
         },
     }
+
+
+def test_combo_rfq_is_rejected_before_pricing() -> None:
+    message = created_message()
+    message["msg"]["mve_collection_ticker"] = "COMBO-COLLECTION"
+    message["msg"]["mve_selected_legs"] = [
+        {"market_ticker": "LEG-1"},
+        {"market_ticker": "LEG-2"},
+    ]
+
+    with pytest.raises(ValueError, match="combo RFQs are not supported"):
+        RFQRequest.from_message(message)
+
+
+def test_prepare_rejects_multiple_allowed_markets_from_same_event() -> None:
+    client = FakeClient()
+    client.market_events["MARKET-2"] = "EVENT-MARKET"
+    client.event_markets["EVENT-MARKET"] = ("MARKET", "MARKET-2")
+    fair_two = replace(fair(probability="0.45"), ticker="MARKET-2")
+    maker = RFQMaker(
+        client=client,  # type: ignore[arg-type]
+        stream=EmptyStream(),
+        fair_book=MultiFairBook({"MARKET": fair(), "MARKET-2": fair_two}),
+        config=RFQMakerConfig(),
+        audit_log=RecordingAudit(),
+        execute=False,
+    )
+
+    with pytest.raises(ValueError, match="multiple markets from event EVENT-MARKET"):
+        asyncio.run(maker.prepare())
+
+
+def test_prepare_rejects_existing_position_in_same_event_sibling() -> None:
+    client = FakeClient()
+    client.event_markets["EVENT-MARKET"] = ("MARKET", "SAME-GAME-PROP")
+    client.positions["SAME-GAME-PROP"] = "1.00"
+    maker = RFQMaker(
+        client=client,  # type: ignore[arg-type]
+        stream=EmptyStream(),
+        fair_book=FakeFairBook(fair()),
+        config=RFQMakerConfig(),
+        audit_log=RecordingAudit(),
+        execute=False,
+    )
+
+    with pytest.raises(ValueError, match="correlated same-event market"):
+        asyncio.run(maker.prepare())
 
 
 def test_execute_quotes_and_confirms_from_cached_fair() -> None:
@@ -330,6 +477,86 @@ def test_accepted_risk_is_retained_until_execution() -> None:
     assert any(event == "rfq_reservation_retained" for event, _ in audit.records)
 
 
+def test_executed_fill_is_written_to_markdown_ledger(tmp_path) -> None:
+    client = FakeClient()
+    audit = RecordingAudit()
+    ledger_path = tmp_path / "RFQ_FILLS.md"
+    maker = RFQMaker(
+        client=client,  # type: ignore[arg-type]
+        stream=EmptyStream(),
+        fair_book=FakeFairBook(fair()),
+        config=RFQMakerConfig(),
+        audit_log=audit,
+        execute=True,
+        fill_ledger=MarkdownRFQFillLedger(ledger_path),
+    )
+
+    async def scenario() -> None:
+        await maker.prepare()
+        await maker.handle(created_message())
+        await maker.handle(accepted_message())
+        await maker.handle(
+            {
+                "type": "quote_executed",
+                "msg": {
+                    "rfq_id": "rfq-1",
+                    "quote_id": "quote-1",
+                    "order_id": "order-1",
+                    "executed_ts": "2026-07-24T20:00:00Z",
+                },
+            }
+        )
+
+    asyncio.run(scenario())
+
+    contents = ledger_path.read_text()
+    assert "2026-07-24T20:00:00Z" in contents
+    assert "`MARKET` YES" in contents
+    assert "3.6364%" in contents
+    assert "$0.0200" in contents
+    assert "<!-- kalshi-rfq-fill:quote-1 -->" in contents
+    executed = [payload for event, payload in audit.records if event == "rfq_quote_executed"]
+    assert executed[0]["edge_rate"] == str(Decimal("0.02") / Decimal("0.55"))
+
+
+def test_reconciliation_records_missed_execution_once(tmp_path) -> None:
+    client = FakeClient()
+    ledger_path = tmp_path / "RFQ_FILLS.md"
+    maker = RFQMaker(
+        client=client,  # type: ignore[arg-type]
+        stream=EmptyStream(),
+        fair_book=FakeFairBook(fair()),
+        config=RFQMakerConfig(),
+        audit_log=RecordingAudit(),
+        execute=True,
+        fill_ledger=MarkdownRFQFillLedger(ledger_path),
+    )
+
+    async def scenario() -> None:
+        await maker.prepare()
+        await maker.handle(created_message())
+        await maker.handle(accepted_message())
+        client.existing_quotes = [
+            {
+                "id": "quote-1",
+                "rfq_id": "rfq-1",
+                "status": "executed",
+                "accepted_side": "yes",
+                "contracts_fp": "1.00",
+                "executed_ts": "2026-07-24T20:00:00Z",
+                "creator_order_id": "order-1",
+            }
+        ]
+        await maker._reconcile_once()
+        await maker._reconcile_once()
+
+    asyncio.run(scenario())
+
+    contents = ledger_path.read_text()
+    assert contents.count("<!-- kalshi-rfq-fill:quote-1 -->") == 1
+    assert "order-1" in contents
+
+
 def test_run_cancels_unaccepted_quotes_on_clean_shutdown() -> None:
     client = FakeClient()
     maker = RFQMaker(
@@ -345,6 +572,31 @@ def test_run_cancels_unaccepted_quotes_on_clean_shutdown() -> None:
 
     assert client.deleted == [("rfq-1", "quote-1")]
     assert maker.ledger.reservations == {}
+
+
+def test_run_aggregates_unsupported_rfqs_without_creating_tasks() -> None:
+    client = FakeClient()
+    audit = RecordingAudit()
+    maker = RFQMaker(
+        client=client,  # type: ignore[arg-type]
+        stream=UnsupportedBurstStream(),
+        fair_book=FakeFairBook(fair()),
+        config=RFQMakerConfig(),
+        audit_log=audit,
+        execute=False,
+    )
+
+    asyncio.run(maker.run())
+
+    summaries = [
+        payload for event, payload in audit.records if event == "rfq_unsupported_summary"
+    ]
+    assert sum(int(item["messages"]) for item in summaries) == 2_500
+    assert len(summaries) == 3
+    assert not any(event == "rfq_quote_skipped" for event, _ in audit.records)
+    assert maker.closed_rfqs == set()
+    assert maker.ledger.reservations == {}
+    assert client.created == []
 
 
 def test_startup_refuses_unresolved_existing_quotes() -> None:

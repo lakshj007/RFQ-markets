@@ -47,6 +47,7 @@ from .rfq import (
     RFQ_LIVE_ACKNOWLEDGEMENT,
     RFQ_LIVE_ENABLE_TOKEN,
     JsonMoneylineFairBook,
+    MarkdownRFQFillLedger,
     OddsMoneylineFairBook,
     RFQMaker,
     RFQMakerConfig,
@@ -1039,12 +1040,16 @@ class _RFQAudit:
             "rfq_quote_executed",
             "rfq_quote_ambiguous",
             "rfq_quote_skipped",
+            "rfq_unsupported_summary",
             "rfq_confirmation_withheld",
         }:
             ticker = payload.get("ticker", "-")
             rfq_id = payload.get("rfq_id", "-")
-            detail = payload.get("reason") or (
-                f"YES {payload.get('yes_bid', '-')} / NO {payload.get('no_bid', '-')}"
+            detail = (
+                f"{payload.get('messages', 0)} unsupported: {payload.get('reasons', {})}"
+                if event == "rfq_unsupported_summary"
+                else payload.get("reason")
+                or f"YES {payload.get('yes_bid', '-')} / NO {payload.get('no_bid', '-')}"
             )
             print(f"{event}: {ticker} {rfq_id} — {detail}", flush=True)
 
@@ -1128,6 +1133,7 @@ def _cmd_rfq_maker(args: argparse.Namespace) -> None:
         ),
         audit_log=_RFQAudit(args.audit_log, json_output=args.json),
         execute=execute,
+        fill_ledger=MarkdownRFQFillLedger(args.fill_ledger),
         allowed_tickers=set(args.allow_ticker or ()),
     )
     mode = (
@@ -1489,6 +1495,7 @@ def build_parser() -> argparse.ArgumentParser:
     execution.add_argument("--execute-live", action="store_true")
     execution.add_argument("--acknowledge-risk")
     rfq.add_argument("--audit-log", type=Path, default=Path("logs/rfq-maker.jsonl"))
+    rfq.add_argument("--fill-ledger", type=Path, default=Path("RFQ_FILLS.md"))
     rfq.add_argument("--json", action="store_true")
     rfq.set_defaults(func=_cmd_rfq_maker)
 

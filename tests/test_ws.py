@@ -1,5 +1,6 @@
 import asyncio
 import json
+import ssl
 from decimal import Decimal
 
 import pytest
@@ -9,6 +10,7 @@ from kalshi_mm.ws import (
     KalshiStreamState,
     KalshiWebSocket,
     SequenceGapError,
+    websocket_ssl_context,
 )
 
 
@@ -98,6 +100,14 @@ class FakeWebSocket:
 
     async def send(self, raw_message: str) -> None:
         self.messages.append(json.loads(raw_message))
+
+
+def test_websocket_ssl_context_verifies_server_certificates() -> None:
+    context = websocket_ssl_context()
+
+    assert context.check_hostname is True
+    assert context.verify_mode == ssl.CERT_REQUIRED
+    assert context.get_ca_certs()
 
 
 def test_subscriptions_request_unified_prices_and_account_updates() -> None:
