@@ -206,6 +206,28 @@ class KalshiClient:
             authenticated=True,
         )
 
+    def get_subaccount_balances(self) -> list[dict[str, Any]]:
+        return self._request(
+            "GET",
+            "/portfolio/subaccounts/balances",
+            authenticated=True,
+        ).get("subaccount_balances", [])
+
+    def get_api_keys(self) -> list[dict[str, Any]]:
+        return self._request("GET", "/api_keys", authenticated=True).get("api_keys", [])
+
+    def get_positions(self, *, subaccount: int = 0, limit: int = 1000) -> list[dict[str, Any]]:
+        return self._request(
+            "GET",
+            "/portfolio/positions",
+            params={
+                "count_filter": "position",
+                "subaccount": subaccount,
+                "limit": min(max(limit, 1), 1000),
+            },
+            authenticated=True,
+        ).get("market_positions", [])
+
     def get_position(self, ticker: str, *, subaccount: int = 0) -> str:
         data = self._request(
             "GET",
@@ -319,6 +341,13 @@ class KalshiClient:
             params=params,
             authenticated=True,
         ).get("quotes", [])
+
+    def get_rfq_quote(self, quote_id: str) -> dict[str, Any]:
+        return self._request(
+            "GET",
+            f"/communications/quotes/{quote_id}",
+            authenticated=True,
+        )["quote"]
 
     def delete_rfq_quote(self, rfq_id: str, quote_id: str) -> None:
         self._request(

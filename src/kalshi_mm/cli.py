@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import os
+import stat
 import sys
 import time
 from datetime import UTC, datetime, timedelta
@@ -40,10 +42,11 @@ from .live_order import (
     preflight_live_order,
 )
 from .maker_paper import MakerPaperRecorder, MakerPaperUpdate
-from .models import Level, OrderBook, PriceGrid, as_decimal
+from .models import ZERO, Level, OrderBook, PriceGrid, as_decimal
 from .odds import DEFAULT_SHARP_BOOKMAKERS, OddsClient
 from .paper import PaperRecorder
 from .rfq import (
+    KALSHI_MAKER_FEE_RATE,
     RFQ_LIVE_ACKNOWLEDGEMENT,
     RFQ_LIVE_ENABLE_TOKEN,
     JsonMoneylineFairBook,
@@ -1054,6 +1057,81 @@ class _RFQAudit:
             print(f"{event}: {ticker} {rfq_id} — {detail}", flush=True)
 
 
+RFQ_CANARY_COLLECTION = "KXMVESPORTSMULTIGAMEEXTENDED-R"
+RFQ_CANARY_SERIES = "KXMLBGAME"
+RFQ_CANARY_SPORT = "baseball_mlb"
+
+
+def _validate_rfq_live_canary(args: argparse.Namespace) -> None:
+    if not args.canary_live:
+        raise ValueError("production RFQ execution requires --canary-live")
+    if args.fair_file is not None or args.series != RFQ_CANARY_SERIES:
+        raise ValueError(f"live canary requires Odds API fair values from {RFQ_CANARY_SERIES}")
+    if args.odds_sport != RFQ_CANARY_SPORT:
+        raise ValueError(f"live canary requires --odds-sport {RFQ_CANARY_SPORT}")
+    if set(args.allow_collection) != {RFQ_CANARY_COLLECTION} or args.allow_ticker:
+        raise ValueError(
+            f"live canary must allow only collection {RFQ_CANARY_COLLECTION}"
+        )
+    if not args.combo_only or args.allow_live:
+        raise ValueError("live canary requires --combo-only and forbids --allow-live")
+    if args.edge_percent < Decimal("2"):
+        raise ValueError("live canary requires at least 2% net modeled edge")
+    minimum_fee_percent = KALSHI_MAKER_FEE_RATE * Decimal("100")
+    if args.maker_fee_rate_percent < minimum_fee_percent:
+        raise ValueError(f"live canary maker-fee rate must be at least {minimum_fee_percent}%")
+    if not 1 <= args.subaccount <= 32:
+        raise ValueError("live canary requires a dedicated numbered subaccount")
+    if not ZERO < args.min_contracts <= args.max_contracts <= Decimal("1"):
+        raise ValueError("live canary contract limits must be positive and capped at 1")
+    if args.max_position > Decimal("1") or args.max_notional > Decimal("1"):
+        raise ValueError("live canary position and notional limits must be capped at 1")
+    if args.max_session_contracts != Decimal("1"):
+        raise ValueError("live canary requires a one-contract session-wide execution cap")
+    if args.max_active_quotes != 1 or args.max_inflight_rfqs != 1:
+        raise ValueError("live canary requires one active quote and one in-flight handler")
+    if args.min_legs < 2 or args.max_legs > 6:
+        raise ValueError("live canary allows only 2-6 independent moneyline legs")
+    if (
+        not math.isfinite(args.max_fair_age)
+        or not math.isfinite(args.max_quote_latency)
+        or args.max_fair_age > 60
+        or args.max_quote_latency > 1
+    ):
+        raise ValueError("live canary requires fair age <=60s and quote latency <=1s")
+    if args.reconcile_seconds > 15:
+        raise ValueError("live canary reconciliation interval cannot exceed 15 seconds")
+    if not math.isfinite(args.seconds) or args.seconds <= 0 or args.seconds > 30 * 60:
+        raise ValueError("live canary runtime must be between 1 second and 30 minutes")
+
+
+def _preflight_rfq_live_canary(client: KalshiClient, args: argparse.Namespace) -> None:
+    keys = client.get_api_keys()
+    current = next((item for item in keys if item.get("api_key_id") == client.api_key_id), None)
+    if current is None:
+        raise ValueError("current production API key was not returned by Kalshi")
+    if "rfq" not in str(current.get("name", "")).casefold():
+        raise ValueError("live canary requires a dedicated API key whose name contains 'rfq'")
+    if set(current.get("scopes") or ()) != {"read", "write"}:
+        raise ValueError("live canary API key must have exactly read and write scopes")
+    if client.private_key_path is None:
+        raise ValueError("live canary private-key path is missing")
+    key_mode = stat.S_IMODE(client.private_key_path.stat().st_mode)
+    if key_mode & 0o077:
+        raise ValueError("live canary private-key file must not be accessible by group or others")
+
+    subaccounts = client.get_subaccount_balances()
+    if not any(int(item.get("subaccount_number", -1)) == args.subaccount for item in subaccounts):
+        raise ValueError(f"dedicated subaccount {args.subaccount} does not exist")
+    balance = as_decimal(client.get_balance(subaccount=args.subaccount).get("balance", "0"))
+    if balance <= ZERO or balance > Decimal("100"):
+        raise ValueError("live canary subaccount must contain between $0.01 and $1.00")
+    if client.get_orders(status="resting", subaccount=args.subaccount, limit=1000):
+        raise ValueError("live canary subaccount already has resting orders")
+    if client.get_positions(subaccount=args.subaccount, limit=1000):
+        raise ValueError("live canary subaccount already has positions")
+
+
 def _rfq_client(args: argparse.Namespace) -> tuple[KalshiClient, bool, bool]:
     if args.execute_demo and args.execute_live:
         raise ValueError("choose at most one of --execute-demo and --execute-live")
@@ -1077,7 +1155,10 @@ def _rfq_client(args: argparse.Namespace) -> tuple[KalshiClient, bool, bool]:
             raise ValueError(
                 "production RFQ execution requires --allow-ticker or --allow-collection"
             )
-        return _production_client(), False, True
+        _validate_rfq_live_canary(args)
+        client = _production_client()
+        _preflight_rfq_live_canary(client, args)
+        return client, False, True
     if args.demo:
         return KalshiClient.from_env(demo=True), True, False
     return _production_client(), False, False
@@ -1123,10 +1204,12 @@ def _cmd_rfq_maker(args: argparse.Namespace) -> None:
         fair_book=fair_book,
         config=RFQMakerConfig(
             edge_rate=args.edge_percent / Decimal("100"),
+            maker_fee_rate=args.maker_fee_rate_percent / Decimal("100"),
             min_contracts=args.min_contracts,
             max_contracts=args.max_contracts,
             max_abs_position=args.max_position,
             max_notional=args.max_notional,
+            max_session_contracts=args.max_session_contracts,
             max_active_quotes=args.max_active_quotes,
             max_fair_age_seconds=args.max_fair_age,
             reconcile_seconds=args.reconcile_seconds,
@@ -1136,6 +1219,8 @@ def _cmd_rfq_maker(args: argparse.Namespace) -> None:
             max_legs=args.max_legs,
             max_inflight_rfqs=args.max_inflight_rfqs,
             max_quote_latency_seconds=args.max_quote_latency,
+            combo_only=args.combo_only,
+            require_subaccount_metadata=args.execute_live,
         ),
         audit_log=_RFQAudit(args.audit_log, json_output=args.json),
         execute=execute,
@@ -1153,7 +1238,8 @@ def _cmd_rfq_maker(args: argparse.Namespace) -> None:
     if not args.json:
         print(
             f"Starting moneyline RFQ maker ({mode}); minimum edge "
-            f"{args.edge_percent}% of fair value. Audit: {args.audit_log}",
+            f"{args.edge_percent}% of fair value net of modeled maker fees. "
+            f"Audit: {args.audit_log}",
             flush=True,
         )
     asyncio.run(maker.run(seconds=args.seconds, max_messages=args.messages))
@@ -1479,6 +1565,12 @@ def build_parser() -> argparse.ArgumentParser:
     pricing.add_argument("--allow-ticker", action="append", default=[])
     pricing.add_argument("--allow-collection", action="append", default=[])
     pricing.add_argument("--edge-percent", type=_decimal, default=Decimal("2"))
+    pricing.add_argument(
+        "--maker-fee-rate-percent",
+        type=_decimal,
+        default=KALSHI_MAKER_FEE_RATE * Decimal("100"),
+        help="quadratic maker-fee coefficient; applied only to maker-fee series",
+    )
     pricing.add_argument("--min-contracts", type=_decimal, default=Decimal("1"))
     pricing.add_argument("--max-contracts", type=_decimal, default=Decimal("10"))
     pricing.add_argument("--min-legs", type=int, default=2)
@@ -1487,10 +1579,16 @@ def build_parser() -> argparse.ArgumentParser:
     pricing.add_argument("--max-quote-latency", type=float, default=1.0)
     pricing.add_argument("--max-position", type=_decimal, default=Decimal("10"))
     pricing.add_argument("--max-notional", type=_decimal, default=Decimal("10"))
+    pricing.add_argument("--max-session-contracts", type=_decimal)
     pricing.add_argument("--max-active-quotes", type=int, default=20)
     pricing.add_argument("--max-fair-age", type=float, default=60)
     pricing.add_argument("--reconcile-seconds", type=float, default=15)
     pricing.add_argument("--subaccount", type=int, default=0)
+    pricing.add_argument(
+        "--combo-only",
+        action="store_true",
+        help="reject single-market RFQs and quote only allowed MVE collections",
+    )
     pricing.add_argument(
         "--allow-live",
         action="store_true",
@@ -1505,6 +1603,11 @@ def build_parser() -> argparse.ArgumentParser:
     execution = rfq.add_argument_group("execution")
     execution.add_argument("--execute-demo", action="store_true")
     execution.add_argument("--execute-live", action="store_true")
+    execution.add_argument(
+        "--canary-live",
+        action="store_true",
+        help="enforce the locked one-contract/$1 production MLB canary profile",
+    )
     execution.add_argument("--acknowledge-risk")
     rfq.add_argument("--audit-log", type=Path, default=Path("logs/rfq-maker.jsonl"))
     rfq.add_argument("--fill-ledger", type=Path, default=Path("RFQ_FILLS.md"))

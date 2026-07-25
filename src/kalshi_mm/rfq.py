@@ -20,7 +20,73 @@ from .scanner import consensus_probability
 RFQ_LIVE_ENABLE_TOKEN = "I_UNDERSTAND_RFQ_REAL_MONEY"
 RFQ_LIVE_ACKNOWLEDGEMENT = "REAL_MONEY_RFQ_AUTOCONFIRM"
 HARD_MIN_RFQ_EDGE_RATE = Decimal("0.02")
+KALSHI_MAKER_FEE_RATE = Decimal("0.0175")
+KALSHI_FEE_INCREMENT = Decimal("0.0001")
 UNSUPPORTED_AUDIT_BATCH_SIZE = 1_000
+PREPARE_MARKET_BATCH_SIZE = 4
+PREPARE_MARKET_BATCH_SECONDS = 1.0
+AGGREGATED_RFQ_SKIP_REASONS = {
+    "RFQ has no side within position and notional limits",
+    "RFQ size exceeds the per-request contract limit",
+}
+
+
+def estimated_maker_fee(
+    price: Decimal,
+    contracts: Decimal,
+    *,
+    fee_rate: Decimal = KALSHI_MAKER_FEE_RATE,
+    fee_multiplier: Decimal = ONE,
+) -> Decimal:
+    """Conservatively model Kalshi's quadratic maker fee and centicent rounding."""
+    price = as_decimal(price)
+    contracts = as_decimal(contracts)
+    fee_rate = as_decimal(fee_rate)
+    fee_multiplier = as_decimal(fee_multiplier)
+    if price <= ZERO or contracts <= ZERO or fee_rate <= ZERO or fee_multiplier <= ZERO:
+        return ZERO
+    if price >= ONE:
+        raise ValueError("maker-fee price must be in (0, 1)")
+    position_cost = price * contracts
+    raw_fee = fee_multiplier * fee_rate * contracts * price * (ONE - price)
+    rounded_total = (position_cost + raw_fee).quantize(
+        KALSHI_FEE_INCREMENT,
+        rounding=ROUND_CEILING,
+    )
+    return rounded_total - position_cost
+
+
+def modeled_rfq_edge(
+    outcome_fair: Decimal,
+    price: Decimal,
+    contracts: Decimal,
+    *,
+    fee_rate: Decimal,
+    fee_multiplier: Decimal,
+) -> tuple[Decimal, Decimal, Decimal]:
+    expected_value = outcome_fair * contracts
+    if expected_value <= ZERO:
+        raise ValueError("RFQ expected value must be positive")
+    fee = estimated_maker_fee(
+        price,
+        contracts,
+        fee_rate=fee_rate,
+        fee_multiplier=fee_multiplier,
+    )
+    gross_edge_rate = (outcome_fair - price) / outcome_fair
+    net_edge_rate = (expected_value - price * contracts - fee) / expected_value
+    return gross_edge_rate, fee, net_edge_rate
+
+
+def _execution_fee(payload: dict[str, Any]) -> Decimal | None:
+    for key in ("fee_cost", "fee_cost_dollars", "fees_paid_dollars"):
+        value = payload.get(key)
+        if value is not None and str(value).strip() != "":
+            fee = as_decimal(value)
+            if fee < ZERO:
+                raise ValueError("execution fee cannot be negative")
+            return fee
+    return None
 
 
 def _parse_time(value: object, *, field: str) -> datetime:
@@ -347,8 +413,16 @@ class RFQQuotePlan:
     fair: MoneylineFair
     yes_bid: Decimal
     no_bid: Decimal
+    # These are net of the modeled maker fee. Gross edge is retained separately
+    # so audits can distinguish price improvement from fee drag.
     yes_edge_rate: Decimal | None
     no_edge_rate: Decimal | None
+    yes_gross_edge_rate: Decimal | None
+    no_gross_edge_rate: Decimal | None
+    yes_estimated_fee: Decimal
+    no_estimated_fee: Decimal
+    maker_fee_rate: Decimal
+    maker_fee_multiplier: Decimal
     leg_fairs: tuple[MoneylineFair, ...] = ()
 
     @property
@@ -358,8 +432,8 @@ class RFQQuotePlan:
     @property
     def maximum_cost(self) -> Decimal:
         return max(
-            self.yes_bid * self.yes_contracts,
-            self.no_bid * self.no_contracts,
+            self.yes_bid * self.yes_contracts + self.yes_estimated_fee,
+            self.no_bid * self.no_contracts + self.no_estimated_fee,
         )
 
     @staticmethod
@@ -413,12 +487,26 @@ class RFQQuotePlan:
             "no_bid": str(self.no_bid),
             "yes_edge_rate": (str(self.yes_edge_rate) if self.yes_edge_rate is not None else None),
             "no_edge_rate": (str(self.no_edge_rate) if self.no_edge_rate is not None else None),
-            "yes_edge_dollars": (
-                str(self.fair.probability - self.yes_bid) if self.yes_bid > ZERO else None
+            "yes_net_edge_rate": (
+                str(self.yes_edge_rate) if self.yes_edge_rate is not None else None
             ),
-            "no_edge_dollars": (
-                str(ONE - self.fair.probability - self.no_bid) if self.no_bid > ZERO else None
+            "no_net_edge_rate": (
+                str(self.no_edge_rate) if self.no_edge_rate is not None else None
             ),
+            "yes_gross_edge_rate": (
+                str(self.yes_gross_edge_rate)
+                if self.yes_gross_edge_rate is not None
+                else None
+            ),
+            "no_gross_edge_rate": (
+                str(self.no_gross_edge_rate)
+                if self.no_gross_edge_rate is not None
+                else None
+            ),
+            "yes_estimated_maker_fee": str(self.yes_estimated_fee),
+            "no_estimated_maker_fee": str(self.no_estimated_fee),
+            "maker_fee_rate": str(self.maker_fee_rate),
+            "maker_fee_multiplier": str(self.maker_fee_multiplier),
             "maximum_cost": str(self.maximum_cost),
         }
 
@@ -429,36 +517,67 @@ def price_moneyline_rfq(
     *,
     price_grid: PriceGrid,
     edge_rate: Decimal,
+    maker_fee_rate: Decimal = KALSHI_MAKER_FEE_RATE,
+    maker_fee_multiplier: Decimal = ZERO,
     leg_fairs: tuple[MoneylineFair, ...] = (),
 ) -> RFQQuotePlan:
     edge_rate = as_decimal(edge_rate)
+    maker_fee_rate = as_decimal(maker_fee_rate)
+    maker_fee_multiplier = as_decimal(maker_fee_multiplier)
     if not HARD_MIN_RFQ_EDGE_RATE <= edge_rate < ONE:
         raise ValueError("RFQ proportional edge must be in [2%, 100%)")
+    if maker_fee_rate < ZERO or maker_fee_multiplier < ZERO:
+        raise ValueError("RFQ maker-fee inputs cannot be negative")
 
-    def bid_for(outcome_fair: Decimal) -> tuple[Decimal, Decimal | None]:
+    def contracts_for(bid: Decimal) -> Decimal:
+        if request.contracts is not None:
+            return request.contracts
+        assert request.target_cost is not None
+        return RFQQuotePlan._target_contracts(request.target_cost, bid)
+
+    def previous_bid(bid: Decimal) -> Decimal:
+        epsilon = min(item.step for item in price_grid.ranges) / Decimal("10")
+        previous = price_grid.floor(bid - epsilon)
+        return previous if previous < bid else ZERO
+
+    def bid_for(
+        outcome_fair: Decimal,
+    ) -> tuple[Decimal, Decimal | None, Decimal | None, Decimal]:
         raw = outcome_fair * (ONE - edge_rate)
         if raw < price_grid.minimum_order_price:
-            return ZERO, None
+            return ZERO, None, None, ZERO
         bid = price_grid.floor(raw)
-        if bid <= ZERO:
-            return ZERO, None
-        modeled_edge_rate = (outcome_fair - bid) / outcome_fair
-        if modeled_edge_rate < edge_rate:
-            raise ValueError("price-grid rounding violated the configured RFQ edge")
-        return bid, modeled_edge_rate
+        while bid >= price_grid.minimum_order_price:
+            gross_edge_rate, fee, net_edge_rate = modeled_rfq_edge(
+                outcome_fair,
+                bid,
+                contracts_for(bid),
+                fee_rate=maker_fee_rate,
+                fee_multiplier=maker_fee_multiplier,
+            )
+            if net_edge_rate >= edge_rate:
+                return bid, net_edge_rate, gross_edge_rate, fee
+            bid = previous_bid(bid)
+        return ZERO, None, None, ZERO
 
-    yes_bid, yes_edge_rate = bid_for(fair.probability)
-    no_bid, no_edge_rate = bid_for(ONE - fair.probability)
+    yes_bid, yes_edge_rate, yes_gross_edge_rate, yes_fee = bid_for(fair.probability)
+    no_bid, no_edge_rate, no_gross_edge_rate, no_fee = bid_for(ONE - fair.probability)
     if yes_bid + no_bid > ONE:
         raise ValueError("RFQ quote prices cannot sum above $1")
     plan = RFQQuotePlan(
-        request,
-        fair,
-        yes_bid,
-        no_bid,
-        yes_edge_rate,
-        no_edge_rate,
-        leg_fairs,
+        request=request,
+        fair=fair,
+        yes_bid=yes_bid,
+        no_bid=no_bid,
+        yes_edge_rate=yes_edge_rate,
+        no_edge_rate=no_edge_rate,
+        yes_gross_edge_rate=yes_gross_edge_rate,
+        no_gross_edge_rate=no_gross_edge_rate,
+        yes_estimated_fee=yes_fee,
+        no_estimated_fee=no_fee,
+        maker_fee_rate=maker_fee_rate,
+        maker_fee_multiplier=maker_fee_multiplier,
+        leg_fairs=leg_fairs,
     )
     if not plan.has_side:
         raise ValueError("fair value is too close to a boundary to quote either side")
@@ -468,10 +587,12 @@ def price_moneyline_rfq(
 @dataclass(frozen=True, slots=True)
 class RFQMakerConfig:
     edge_rate: Decimal = HARD_MIN_RFQ_EDGE_RATE
+    maker_fee_rate: Decimal = KALSHI_MAKER_FEE_RATE
     min_contracts: Decimal = Decimal("1")
     max_contracts: Decimal = Decimal("10")
     max_abs_position: Decimal = Decimal("10")
     max_notional: Decimal = Decimal("10")
+    max_session_contracts: Decimal | None = None
     max_active_quotes: int = 20
     max_fair_age_seconds: float = 60
     reconcile_seconds: float = 15
@@ -481,22 +602,28 @@ class RFQMakerConfig:
     max_legs: int = 10
     max_inflight_rfqs: int = 32
     max_quote_latency_seconds: float = 1.0
+    combo_only: bool = False
+    require_subaccount_metadata: bool = False
 
     def validate(self) -> None:
         if not HARD_MIN_RFQ_EDGE_RATE <= self.edge_rate < ONE:
             raise ValueError("RFQ proportional edge must be in [2%, 100%)")
+        if self.maker_fee_rate < KALSHI_MAKER_FEE_RATE:
+            raise ValueError("RFQ maker-fee rate cannot be below Kalshi's published 1.75% rate")
         if self.min_contracts <= ZERO or self.max_contracts < self.min_contracts:
             raise ValueError("RFQ contract limits must be positive and ordered")
         if self.max_abs_position <= ZERO:
             raise ValueError("RFQ contract and position limits must be positive")
         if self.max_notional <= ZERO or self.max_active_quotes <= 0:
             raise ValueError("RFQ notional and active-quote limits must be positive")
+        if self.max_session_contracts is not None and self.max_session_contracts <= ZERO:
+            raise ValueError("RFQ session contract limit must be positive when configured")
         if self.max_fair_age_seconds <= 0:
             raise ValueError("RFQ maximum fair age must be positive")
         if not 1 <= self.reconcile_seconds <= 60:
             raise ValueError("RFQ reconciliation interval must be between 1 and 60 seconds")
-        if not 0 <= self.subaccount <= 63:
-            raise ValueError("RFQ subaccount must be between 0 and 63")
+        if not 0 <= self.subaccount <= 32:
+            raise ValueError("RFQ subaccount must be between 0 and 32")
         if self.min_legs < 2 or self.max_legs < self.min_legs:
             raise ValueError("RFQ parlay leg limits must start at two and be ordered")
         if self.max_inflight_rfqs <= 0:
@@ -520,14 +647,15 @@ class MarkdownRFQFillLedger:
 
     HEADER = (
         "# RFQ Fill Ledger\n\n"
-        "This file is updated when the maker observes an executed RFQ. Edge is the modeled\n"
-        "pre-fee edge at confirmation when available, otherwise the quote-time edge. Parlay\n"
-        "fair value is the product of independent selected-leg moneyline probabilities; the\n"
-        "configured proportional edge is applied once to that complete parlay fair value.\n\n"
+        "This file is updated when the maker observes an executed RFQ. Net edge includes the\n"
+        "actual fill fee when the Fills API returns it, otherwise the conservative modeled fee.\n"
+        "Parlay fair value is the product of independent selected-leg moneyline probabilities;\n"
+        "the configured proportional edge is applied once to that complete parlay fair value.\n\n"
         "| Executed (UTC) | Structure | Event/game | Legs | Side | Contracts | Fair | Quote | "
-        "Edge | Edge/contract | Total modeled edge | RFQ | Quote | Order | Source |\n"
-        "| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | "
-        "--- | --- | --- |\n"
+        "Gross edge | Fee | Fee source | Net edge | Gross edge $ | Net edge $ | RFQ | Quote | "
+        "Order | Source |\n"
+        "| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | "
+        "---: | ---: | --- | --- | --- | --- |\n"
     )
 
     def __init__(self, path: str | Path) -> None:
@@ -552,9 +680,22 @@ class MarkdownRFQFillLedger:
         quote_price = plan.yes_bid if side == "yes" else plan.no_bid
         quote_time_fair = plan.fair.probability if side == "yes" else ONE - plan.fair.probability
         outcome_fair = reservation.confirmed_outcome_fair or quote_time_fair
-        edge_rate = reservation.confirmed_edge_rate or ((outcome_fair - quote_price) / outcome_fair)
-        edge_per_contract = outcome_fair - quote_price
-        total_edge = edge_per_contract * contracts
+        gross_edge_rate = (outcome_fair - quote_price) / outcome_fair
+        gross_edge = (outcome_fair - quote_price) * contracts
+        estimated_fee = estimated_maker_fee(
+            quote_price,
+            contracts,
+            fee_rate=plan.maker_fee_rate,
+            fee_multiplier=plan.maker_fee_multiplier,
+        )
+        actual_fee = _execution_fee(execution)
+        fee = actual_fee if actual_fee is not None else estimated_fee
+        fee_source = str(
+            execution.get("fee_source")
+            or ("execution" if actual_fee is not None else "modeled")
+        )
+        net_edge = gross_edge - fee
+        net_edge_rate = net_edge / (outcome_fair * contracts)
         quote_id = reservation.quote_id
         marker = f"<!-- kalshi-rfq-fill:{quote_id} -->"
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -580,8 +721,9 @@ class MarkdownRFQFillLedger:
         row = (
             f"| {self._cell(executed_at)} | {structure} | "
             f"{self._cell(event)} | {legs} | {side.upper()} | {contracts} | "
-            f"${outcome_fair:.4f} | ${quote_price:.4f} | {edge_rate:.4%} | "
-            f"${edge_per_contract:.4f} | ${total_edge:.4f} | "
+            f"${outcome_fair:.4f} | ${quote_price:.4f} | {gross_edge_rate:.4%} | "
+            f"${fee:.4f} | {self._cell(fee_source)} | {net_edge_rate:.4%} | "
+            f"${gross_edge:.4f} | ${net_edge:.4f} | "
             f"{self._cell(plan.request.rfq_id)} | {self._cell(quote_id)} {marker} | "
             f"{self._cell(order_id)} | {self._cell(plan.fair.source)} |\n"
         )
@@ -602,6 +744,7 @@ class RFQRiskLedger:
         self.positions = dict(positions or {})
         self.available_balance = available_balance
         self.reservations: dict[str, QuoteReservation] = {}
+        self.executed_contracts = ZERO
 
     def _reserved_balance(self) -> Decimal:
         return sum(
@@ -638,6 +781,23 @@ class RFQRiskLedger:
         no_bid = plan.no_bid
         yes_contracts = plan.yes_contracts
         no_contracts = plan.no_contracts
+        if self.config.max_session_contracts is not None:
+            reserved_contracts = sum(
+                (
+                    max(item.plan.yes_contracts, item.plan.no_contracts)
+                    for item in self.reservations.values()
+                ),
+                ZERO,
+            )
+            remaining_contracts = (
+                self.config.max_session_contracts
+                - self.executed_contracts
+                - reserved_contracts
+            )
+            if yes_contracts > remaining_contracts:
+                yes_bid = ZERO
+            if no_contracts > remaining_contracts:
+                no_bid = ZERO
         if (
             yes_contracts < self.config.min_contracts
             or yes_contracts > self.config.max_contracts
@@ -658,6 +818,10 @@ class RFQRiskLedger:
             no_bid=no_bid,
             yes_edge_rate=plan.yes_edge_rate if yes_bid > ZERO else None,
             no_edge_rate=plan.no_edge_rate if no_bid > ZERO else None,
+            yes_gross_edge_rate=plan.yes_gross_edge_rate if yes_bid > ZERO else None,
+            no_gross_edge_rate=plan.no_gross_edge_rate if no_bid > ZERO else None,
+            yes_estimated_fee=plan.yes_estimated_fee if yes_bid > ZERO else ZERO,
+            no_estimated_fee=plan.no_estimated_fee if no_bid > ZERO else ZERO,
         )
         if not constrained.has_side:
             raise ValueError("RFQ has no side within position and notional limits")
@@ -688,8 +852,15 @@ class RFQRiskLedger:
         self.positions[ticker] = self.positions.get(ticker, ZERO) + (
             count if side == "yes" else -count
         )
+        self.executed_contracts += count
         price = reservation.plan.yes_bid if side == "yes" else reservation.plan.no_bid
-        self.available_balance = max(self.available_balance - price * count, ZERO)
+        fee = estimated_maker_fee(
+            price,
+            count,
+            fee_rate=reservation.plan.maker_fee_rate,
+            fee_multiplier=reservation.plan.maker_fee_multiplier,
+        )
+        self.available_balance = max(self.available_balance - price * count - fee, ZERO)
 
 
 class RFQMessageStream(Protocol):
@@ -725,6 +896,9 @@ class RFQMaker:
         self.allowed_tickers = set(allowed_tickers or ())
         self.allowed_collections = set(allowed_collections or ())
         self.price_grids: dict[str, PriceGrid] = {}
+        self.maker_fee_multipliers: dict[str, Decimal] = {}
+        self.series_maker_fee_multipliers: dict[str, Decimal] = {}
+        self._series_fee_tasks: dict[str, asyncio.Task[Decimal]] = {}
         self.event_tickers: dict[str, str] = {}
         self.event_markets: dict[str, tuple[str, ...]] = {}
         self.ledger = RFQRiskLedger(config)
@@ -765,6 +939,8 @@ class RFQMaker:
         except (InvalidOperation, TypeError, ValueError):
             return "invalid RFQ shape"
         if not request.is_combo:
+            if self.config.combo_only:
+                return "single-market RFQs are disabled"
             if not self._ticker_allowed(request.ticker):
                 return "ticker is not on the moneyline allowlist"
             return None
@@ -790,8 +966,6 @@ class RFQMaker:
             outcome_fair = plan.fair.probability if side == "yes" else ONE - plan.fair.probability
         quoted_price = plan.yes_bid if side == "yes" else plan.no_bid if side == "no" else None
         edge_rate = reservation.confirmed_edge_rate
-        if edge_rate is None and outcome_fair and quoted_price is not None:
-            edge_rate = (outcome_fair - quoted_price) / outcome_fair
         if plan.request.is_combo:
             event_ticker = ",".join(leg.event_ticker for leg in plan.request.legs)
             structure = "independent_moneyline_parlay"
@@ -813,15 +987,40 @@ class RFQMaker:
             "outcome_fair": str(outcome_fair) if outcome_fair is not None else None,
             "quoted_price": str(quoted_price) if quoted_price is not None else None,
             "edge_rate": str(edge_rate) if edge_rate is not None else None,
-            "edge_dollars": (
-                str(outcome_fair - quoted_price)
-                if outcome_fair is not None and quoted_price is not None
-                else None
-            ),
             "order_id": str(execution.get("order_id") or execution.get("creator_order_id") or ""),
             "executed_ts": str(execution.get("executed_ts") or ""),
             "reconciled": reconciled,
         }
+        if outcome_fair is not None and quoted_price is not None and side in {"yes", "no"}:
+            contracts = reservation.accepted_contracts
+            gross_edge_rate = (outcome_fair - quoted_price) / outcome_fair
+            gross_edge = (outcome_fair - quoted_price) * contracts
+            estimated_fee = estimated_maker_fee(
+                quoted_price,
+                contracts,
+                fee_rate=plan.maker_fee_rate,
+                fee_multiplier=plan.maker_fee_multiplier,
+            )
+            actual_fee = _execution_fee(execution)
+            fee = actual_fee if actual_fee is not None else estimated_fee
+            net_edge = gross_edge - fee
+            net_edge_rate = net_edge / (outcome_fair * contracts)
+            payload.update(
+                {
+                    "gross_edge_rate": str(gross_edge_rate),
+                    "gross_edge_dollars": str(gross_edge),
+                    "estimated_maker_fee": str(estimated_fee),
+                    "actual_fee": str(actual_fee) if actual_fee is not None else None,
+                    "fee_source": str(
+                        execution.get("fee_source")
+                        or ("execution" if actual_fee is not None else "modeled")
+                    ),
+                    "net_edge_rate": str(net_edge_rate),
+                    "net_edge_dollars": str(net_edge),
+                    "edge_rate": str(net_edge_rate),
+                    "fee_model_breach": net_edge_rate < self.config.edge_rate,
+                }
+            )
         if self.fill_ledger is not None:
             try:
                 self.fill_ledger.append(
@@ -839,6 +1038,60 @@ class RFQMaker:
                     },
                 )
         self._audit("rfq_quote_executed", payload)
+
+    async def _execution_with_actual_fee(
+        self,
+        execution: dict[str, Any],
+    ) -> dict[str, Any]:
+        if _execution_fee(execution) is not None:
+            return {**execution, "fee_source": execution.get("fee_source") or "execution"}
+        order_id = str(execution.get("creator_order_id") or execution.get("order_id") or "")
+        if not order_id:
+            return execution
+        for delay in (0.0, 0.1, 0.25):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                fills = await asyncio.to_thread(
+                    self.client.get_fills,
+                    order_id=order_id,
+                    subaccount=self.config.subaccount,
+                    limit=1000,
+                )
+                fees = [_execution_fee(fill) for fill in fills]
+                if fills and all(fee is not None for fee in fees):
+                    total = sum((fee for fee in fees if fee is not None), ZERO)
+                    return {**execution, "fee_cost": str(total), "fee_source": "fills_api"}
+            except Exception as exc:
+                self._audit(
+                    "rfq_fill_fee_lookup_failed",
+                    {"order_id": order_id, "reason": str(exc)},
+                )
+                break
+        return execution
+
+    def _require_expected_subaccount(self, payload: dict[str, Any]) -> None:
+        if not self.config.require_subaccount_metadata:
+            return
+        raw = payload.get("subaccount", payload.get("creator_subaccount"))
+        if raw is None or int(raw) != self.config.subaccount:
+            raise ValueError("RFQ message subaccount is missing or does not match the canary")
+
+    @staticmethod
+    def _recover_acceptance(reservation: QuoteReservation, quote: dict[str, Any]) -> None:
+        side = str(quote.get("accepted_side", "")).casefold()
+        if side not in {"yes", "no"}:
+            raise ValueError("executed quote is missing its accepted side")
+        count = as_decimal(
+            quote.get("contracts_fp")
+            or quote.get(f"{side}_contracts_fp")
+            or quote.get(f"{side}_contracts_offered_fp")
+            or "0"
+        )
+        if count <= ZERO or count > reservation.plan.contracts_for(side):
+            raise ValueError("executed quote has an invalid accepted size")
+        reservation.accepted_side = side
+        reservation.accepted_contracts = count
 
     def _fair(self, ticker: str, *, now: datetime | None = None) -> MoneylineFair:
         fair = self.fair_book.get(ticker)
@@ -864,6 +1117,8 @@ class RFQMaker:
         now: datetime | None = None,
     ) -> tuple[MoneylineFair, tuple[MoneylineFair, ...]]:
         if not request.is_combo:
+            if self.config.combo_only:
+                raise ValueError("single-market RFQs are disabled")
             if not self._ticker_allowed(request.ticker):
                 raise ValueError("ticker is not on the moneyline allowlist")
             return self._fair(request.ticker, now=now), ()
@@ -913,6 +1168,51 @@ class RFQMaker:
         aggregate.validate()
         return aggregate, tuple(leg_fairs)
 
+    async def _load_series_maker_fee_multiplier(self, series_ticker: str) -> Decimal:
+        series = await asyncio.to_thread(self.client.get_series_details, series_ticker)
+        if str(series.get("ticker", "")).strip() != series_ticker:
+            raise ValueError("derived market series ticker failed canonical verification")
+        fee_type = str(series.get("fee_type", "")).casefold().strip()
+        if fee_type == "quadratic":
+            multiplier = ZERO
+        elif fee_type == "quadratic_with_maker_fees":
+            multiplier = as_decimal(series.get("fee_multiplier", "0"))
+            if multiplier <= ZERO:
+                raise ValueError("maker-fee series has a non-positive fee multiplier")
+        else:
+            raise ValueError(f"unsupported or unknown RFQ maker fee type: {fee_type or 'missing'}")
+        self.series_maker_fee_multipliers[series_ticker] = multiplier
+        return multiplier
+
+    async def _maker_fee_multiplier(
+        self,
+        market: dict[str, Any],
+        *,
+        market_ticker: str,
+    ) -> Decimal:
+        series_ticker = str(market.get("series_ticker", "")).strip()
+        if not series_ticker and "-" in market_ticker:
+            # Some current market payloads omit series_ticker. Kalshi market
+            # tickers are series-prefixed; verify the derived value against the
+            # canonical Series endpoint before using its fee metadata.
+            series_ticker = market_ticker.split("-", 1)[0]
+        if not series_ticker:
+            raise ValueError("market is missing a series ticker required for fee checks")
+        cached = self.series_maker_fee_multipliers.get(series_ticker)
+        if cached is not None:
+            return cached
+        task = self._series_fee_tasks.get(series_ticker)
+        if task is None:
+            task = asyncio.create_task(
+                self._load_series_maker_fee_multiplier(series_ticker)
+            )
+            self._series_fee_tasks[series_ticker] = task
+        try:
+            return await task
+        finally:
+            if task.done():
+                self._series_fee_tasks.pop(series_ticker, None)
+
     async def _ensure_leg_market(self, ticker: str) -> PriceGrid:
         existing = self.price_grids.get(ticker)
         if existing is not None:
@@ -923,13 +1223,14 @@ class RFQMaker:
         event_ticker = str(market.get("event_ticker", "")).strip()
         if not event_ticker:
             raise ValueError("market is missing an event ticker required for correlation checks")
-        event, position = await asyncio.gather(
+        event, position, fee_multiplier = await asyncio.gather(
             asyncio.to_thread(self.client.get_event, event_ticker),
             asyncio.to_thread(
                 self.client.get_position,
                 ticker,
                 subaccount=self.config.subaccount,
             ),
+            self._maker_fee_multiplier(market, market_ticker=ticker),
         )
         event_market_tickers = tuple(
             sorted(
@@ -974,6 +1275,7 @@ class RFQMaker:
         grid = PriceGrid.from_market(market)
         async with self._lock:
             self.price_grids[ticker] = grid
+            self.maker_fee_multipliers[ticker] = fee_multiplier
             self.event_tickers[ticker] = event_ticker
             self.event_markets[event_ticker] = event_market_tickers
             self.ledger.positions[ticker] = as_decimal(position)
@@ -1013,9 +1315,14 @@ class RFQMaker:
         requested_legs = {(leg.market_ticker, leg.event_ticker, leg.side) for leg in request.legs}
         if actual_legs != requested_legs:
             raise ValueError("combo market selected legs do not match the RFQ")
+        fee_multiplier = await self._maker_fee_multiplier(
+            market,
+            market_ticker=request.ticker,
+        )
         grid = PriceGrid.from_market(market)
         async with self._lock:
             self.price_grids[request.ticker] = grid
+            self.maker_fee_multipliers[request.ticker] = fee_multiplier
             self.event_tickers[request.ticker] = str(market.get("event_ticker", ""))
             self.ledger.positions[request.ticker] = as_decimal(position)
         return grid
@@ -1071,7 +1378,13 @@ class RFQMaker:
         )
         available_cents = as_decimal(balance.get("balance", "0"))
         self.ledger.available_balance = available_cents / Decimal("100")
-        await asyncio.gather(*(self._ensure_leg_market(ticker) for ticker in selected))
+        for offset in range(0, len(selected), PREPARE_MARKET_BATCH_SIZE):
+            batch = selected[offset : offset + PREPARE_MARKET_BATCH_SIZE]
+            await asyncio.gather(*(self._ensure_leg_market(ticker) for ticker in batch))
+            if offset + PREPARE_MARKET_BATCH_SIZE < len(selected):
+                # Basic accounts refill 200 read tokens/s. Four markets can
+                # consume up to 160 default-cost tokens during initialization.
+                await asyncio.sleep(PREPARE_MARKET_BATCH_SECONDS)
         self._audit(
             "rfq_maker_ready",
             {
@@ -1079,7 +1392,17 @@ class RFQMaker:
                 "tickers": list(selected),
                 "event_tickers": {ticker: self.event_tickers[ticker] for ticker in selected},
                 "edge_rate": str(self.config.edge_rate),
+                "maker_fee_rate": str(self.config.maker_fee_rate),
+                "maker_fee_multipliers": {
+                    ticker: str(self.maker_fee_multipliers[ticker]) for ticker in selected
+                },
                 "max_fair_age_seconds": self.config.max_fair_age_seconds,
+                "max_session_contracts": (
+                    str(self.config.max_session_contracts)
+                    if self.config.max_session_contracts is not None
+                    else None
+                ),
+                "subaccount": self.config.subaccount,
                 "available_balance": str(self.ledger.available_balance),
             },
         )
@@ -1113,6 +1436,8 @@ class RFQMaker:
                 fair,
                 price_grid=grid,
                 edge_rate=self.config.edge_rate,
+                maker_fee_rate=self.config.maker_fee_rate,
+                maker_fee_multiplier=self.maker_fee_multipliers[request.ticker],
                 leg_fairs=leg_fairs,
             )
             async with self._lock:
@@ -1169,6 +1494,9 @@ class RFQMaker:
             if reservation_created and not retain_reservation_on_error and request is not None:
                 async with self._lock:
                     self.ledger.release(request.rfq_id)
+            if not retain_reservation_on_error and str(exc) in AGGREGATED_RFQ_SKIP_REASONS:
+                self._record_unsupported(str(exc))
+                return
             payload = message.get("msg") if isinstance(message.get("msg"), dict) else {}
             self._audit(
                 "rfq_quote_ambiguous" if retain_reservation_on_error else "rfq_quote_skipped",
@@ -1194,6 +1522,7 @@ class RFQMaker:
             side = str(payload.get("accepted_side", ""))
             if side not in {"yes", "no"}:
                 raise ValueError("accepted RFQ side is invalid")
+            self._require_expected_subaccount(payload)
             count = as_decimal(payload.get("contracts_accepted_fp", "0"))
             if count <= ZERO or count > reservation.plan.contracts_for(side):
                 raise ValueError("accepted RFQ size exceeds the reserved quote")
@@ -1202,10 +1531,17 @@ class RFQMaker:
                 raise ValueError("customer accepted a disabled RFQ side")
             fair, _ = self._request_fair(reservation.plan.request)
             outcome_fair = fair.probability if side == "yes" else ONE - fair.probability
-            current_edge_rate = (outcome_fair - quoted_price) / outcome_fair
+            gross_edge_rate, estimated_fee, current_edge_rate = modeled_rfq_edge(
+                outcome_fair,
+                quoted_price,
+                count,
+                fee_rate=reservation.plan.maker_fee_rate,
+                fee_multiplier=reservation.plan.maker_fee_multiplier,
+            )
             if current_edge_rate < self.config.edge_rate:
                 raise ValueError(
-                    "fair value moved through the minimum proportional edge before confirmation"
+                    "fair value moved through the minimum proportional edge net of fees "
+                    "before confirmation"
                 )
             if not self.execute:
                 raise ValueError("dry-run quotes cannot be confirmed")
@@ -1241,7 +1577,10 @@ class RFQMaker:
                 "accepted_side": side,
                 "contracts_fp": str(count),
                 "current_outcome_fair": str(outcome_fair),
+                "current_gross_edge_rate": str(gross_edge_rate),
+                "current_estimated_maker_fee": str(estimated_fee),
                 "current_edge_rate": str(current_edge_rate),
+                "current_net_edge_rate": str(current_edge_rate),
                 "latency_ms": round(elapsed_ms, 3),
             },
         )
@@ -1277,11 +1616,45 @@ class RFQMaker:
             return
         rfq_id = str(payload.get("rfq_id", ""))
         async with self._lock:
+            reservation = self.ledger.reservations.get(rfq_id)
+        if reservation is None:
+            return
+        execution = payload
+        if reservation.accepted_side is None:
+            try:
+                quote = await asyncio.to_thread(
+                    self.client.get_rfq_quote,
+                    reservation.quote_id,
+                )
+                self._require_expected_subaccount(quote)
+                async with self._lock:
+                    self._recover_acceptance(reservation, quote)
+                execution = {**quote, **payload}
+            except Exception as exc:
+                self._audit(
+                    "rfq_execution_ambiguous",
+                    {
+                        "rfq_id": rfq_id,
+                        "quote_id": reservation.quote_id,
+                        "reason": str(exc),
+                        "risk_reserved": True,
+                    },
+                )
+                return
+        async with self._lock:
             reservation = self.ledger.release(rfq_id)
             if reservation is not None:
                 self.ledger.record_execution(reservation)
         if reservation is not None:
-            self._record_fill(reservation, payload)
+            try:
+                self._require_expected_subaccount(execution)
+            except ValueError as exc:
+                self._audit(
+                    "rfq_execution_subaccount_mismatch",
+                    {"rfq_id": rfq_id, "quote_id": reservation.quote_id, "reason": str(exc)},
+                )
+            execution = await self._execution_with_actual_fee(execution)
+            self._record_fill(reservation, execution)
 
     async def handle(self, message: dict[str, Any], *, received_at: float | None = None) -> None:
         received_at = received_at or time.monotonic()
@@ -1386,7 +1759,8 @@ class RFQMaker:
                 self.ledger.available_balance = available
         for rfq_id, reservation, quote, status, executed in released:
             if executed:
-                self._record_fill(reservation, quote, reconciled=True)
+                execution = await self._execution_with_actual_fee(quote)
+                self._record_fill(reservation, execution, reconciled=True)
             self._audit(
                 "rfq_quote_reconciled",
                 {

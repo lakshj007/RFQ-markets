@@ -163,3 +163,32 @@ def test_create_and_confirm_rfq_quote_use_communications_endpoints(monkeypatch) 
         "/communications/rfqs/rfq-1/quotes/quote-1/confirm"
     )
     assert session.calls[1]["json"] == {}
+
+
+def test_rfq_canary_preflight_reads_use_exact_authenticated_endpoints(monkeypatch) -> None:
+    client = KalshiClient()
+    calls: list[tuple[str, str, dict]] = []
+
+    def request(method: str, path: str, **kwargs):
+        calls.append((method, path, kwargs))
+        if path == "/api_keys":
+            return {"api_keys": [{"api_key_id": "key"}]}
+        if path == "/portfolio/subaccounts/balances":
+            return {"subaccount_balances": [{"subaccount_number": 1}]}
+        if path == "/portfolio/positions":
+            return {"market_positions": []}
+        return {"quote": {"id": "quote-1"}}
+
+    monkeypatch.setattr(client, "_request", request)
+
+    assert client.get_api_keys() == [{"api_key_id": "key"}]
+    assert client.get_subaccount_balances() == [{"subaccount_number": 1}]
+    assert client.get_positions(subaccount=1) == []
+    assert client.get_rfq_quote("quote-1") == {"id": "quote-1"}
+    assert [(method, path) for method, path, _ in calls] == [
+        ("GET", "/api_keys"),
+        ("GET", "/portfolio/subaccounts/balances"),
+        ("GET", "/portfolio/positions"),
+        ("GET", "/communications/quotes/quote-1"),
+    ]
+    assert all(kwargs["authenticated"] is True for _, _, kwargs in calls)

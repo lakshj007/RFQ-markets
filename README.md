@@ -274,35 +274,74 @@ kalshi-mm rfq-maker \
   --max-fair-age 60
 ```
 
-Production execution requires production-only Kalshi credentials, at least one exact
-ticker or MVE collection allowlist entry, an ephemeral enable variable, and the exact
-acknowledgement:
+Before production, run the exact canary profile as a read-only shadow. This sees live
+RFQs and produces quote decisions, but does not call any quote or confirmation write
+endpoint:
+
+```bash
+kalshi-mm rfq-maker \
+  --series KXMLBGAME \
+  --odds-sport baseball_mlb \
+  --allow-collection KXMVESPORTSMULTIGAMEEXTENDED-R \
+  --combo-only \
+  --edge-percent 2 \
+  --min-contracts 1 \
+  --max-contracts 1 \
+  --min-legs 2 \
+  --max-legs 6 \
+  --max-inflight-rfqs 1 \
+  --max-position 1 \
+  --max-notional 1 \
+  --max-session-contracts 1 \
+  --max-active-quotes 1 \
+  --seconds 1800
+```
+
+Production RFQs are locked to a bounded MLB canary. It requires a dedicated numbered
+subaccount funded with no more than $1, a private key file with mode `600`, a dedicated
+API key whose name contains `rfq` and whose scopes are exactly `read`/`write`, the exact
+collection and fair source below, and the ephemeral enable variable and acknowledgement:
 
 ```bash
 export KALSHI_RFQ_LIVE_ENABLED='I_UNDERSTAND_RFQ_REAL_MONEY'
 
 kalshi-mm rfq-maker \
-  --fair-file rfq-fairs.json \
-  --allow-collection KALSHI-MVE-COLLECTION \
+  --series KXMLBGAME \
+  --odds-sport baseball_mlb \
+  --allow-collection KXMVESPORTSMULTIGAMEEXTENDED-R \
+  --combo-only \
   --edge-percent 2 \
-  --max-fair-age 5 \
   --min-contracts 1 \
-  --max-contracts 10 \
+  --max-contracts 1 \
   --min-legs 2 \
   --max-legs 6 \
-  --max-inflight-rfqs 32 \
+  --max-inflight-rfqs 1 \
   --max-quote-latency 1 \
-  --max-position 10 \
-  --max-notional 5 \
+  --max-position 1 \
+  --max-notional 1 \
+  --max-session-contracts 1 \
+  --max-active-quotes 1 \
+  --subaccount 1 \
+  --seconds 900 \
+  --canary-live \
   --execute-live \
   --acknowledge-risk REAL_MONEY_RFQ_AUTOCONFIRM
 
 unset KALSHI_RFQ_LIVE_ENABLED
 ```
 
+The maker reads each quote market's series fee type and multiplier. For
+`quadratic_with_maker_fees`, it models Kalshi's maker fee by rounding the position cost
+plus `0.0175 × multiplier × contracts × price × (1-price)` up to a centicent, then
+subtracting the position cost. `quadratic` series have zero maker fee. Prices move down
+the valid grid
+until the expected edge after that fee is at least the configured 2%. Unknown fee types
+fail closed.
+
 The maker rechecks fair-value age, event start, accepted side, accepted size, and the
-full configured edge immediately before confirmation. It reserves balance and both
-directional position outcomes across outstanding quotes, retains accepted exposure
+full net configured edge immediately before confirmation. It reserves balance, modeled
+fees, and both directional position outcomes across outstanding quotes, retains accepted
+exposure
 through Kalshi's execution timer, uses `post_only=true`, and never rests a remainder.
 It reconciles quote state and portfolio risk every 15 seconds, refuses to start over
 unresolved quotes from an earlier process, and cancels its unaccepted quotes on clean
@@ -310,7 +349,9 @@ shutdown. Every decision and measured quote/confirmation latency is appended to
 `logs/rfq-maker.jsonl`. Every observed execution is also appended idempotently to
 `RFQ_FILLS.md` by default; use `--fill-ledger PATH` to choose another Markdown file.
 Each row records the game/event, legs, accepted side, contracts, confirmation fair,
-quote price, proportional edge, modeled edge dollars, IDs, and fair source. REST
+quote price, gross edge, actual or modeled fee, net edge, IDs, and fair source. The Fills
+API is queried by the maker order ID so actual `fee_cost` replaces the modeled fee when
+available. REST
 reconciliation writes a missed execution too, so a dropped WebSocket execution message
 does not silently omit the fill.
 
@@ -327,9 +368,10 @@ does not silently omit the fill.
    participant identities, in-play legs, sibling-event positions, and overlap with any
    active quote reservation. Missing correlation metadata is a rejection, not an
    assumption of independence.
-4. Convert every leg to its selected-side probability and multiply them once. Calculate
-   both combo outcome bids as `outcome_fair × (1 - edge_rate)`, then round down to the
-   combo market's valid price grid. Rounding down can only increase our edge.
+4. Convert every leg to its selected-side probability and multiply them once. Start each
+   combo outcome bid at `outcome_fair × (1 - edge_rate)`, round down to the valid grid,
+   then step down as needed until modeled maker fees still leave the full proportional
+   edge net of fees.
 5. Resolve fixed-size requests directly. For target-cost requests, conservatively round
    each side's derived size up to the next 0.01 contract for local risk checks. Disable
    a side if its size, position, notional, or balance limit would be exceeded.
@@ -338,11 +380,11 @@ does not silently omit the fill.
    by default; excess burst traffic and any request delayed over one second are dropped
    fail-closed instead of building a stale work queue.
 7. On `quote_accepted`, validate the exchange-reported accepted count, reload every
-   latest leg fair, rebuild the full parlay fair, and confirm only if the configured
-   proportional edge still remains.
+   latest leg fair, rebuild the full parlay fair, recompute the accepted-size fee, and
+   confirm only if the configured net proportional edge still remains.
 8. Retain the exposure reservation through Kalshi's execution timer, reconcile it from
    quote and portfolio state, and release it after execution or cancellation. Record
-   every observed fill, its legs, quote, fair, percentage edge, and modeled dollar edge
+   every observed fill, its legs, quote, fair, actual or modeled fee, and gross/net edge
    in `RFQ_FILLS.md`.
 9. Cancel all unaccepted quotes on clean shutdown; refuse a new executable session if
    unresolved quotes from an earlier process still exist.

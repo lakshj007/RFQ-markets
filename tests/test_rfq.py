@@ -19,6 +19,7 @@ from kalshi_mm.rfq import (
     RFQMakerConfig,
     RFQRequest,
     RFQRiskLedger,
+    estimated_maker_fee,
     price_moneyline_rfq,
 )
 from kalshi_mm.scanner import ConsensusPrice
@@ -86,6 +87,82 @@ def test_grid_rounding_can_only_improve_maker_edge() -> None:
     assert plan.no_edge_rate > Decimal("0.02")
 
 
+def test_maker_fee_is_reserved_and_price_keeps_two_percent_net_edge() -> None:
+    plan = price_moneyline_rfq(
+        request(),
+        fair(probability="0.30"),
+        price_grid=PriceGrid.uniform("0.001"),
+        edge_rate=Decimal("0.02"),
+        maker_fee_multiplier=Decimal("1"),
+    )
+
+    assert estimated_maker_fee(Decimal("0.290"), Decimal("1")) == Decimal("0.0037")
+    assert plan.yes_bid == Decimal("0.290")
+    assert plan.yes_gross_edge_rate == Decimal("0.01") / Decimal("0.30")
+    assert plan.yes_estimated_fee == Decimal("0.0037")
+    assert plan.yes_edge_rate == Decimal("0.021")
+    assert plan.maximum_cost >= plan.yes_bid + plan.yes_estimated_fee
+
+
+def test_fee_free_series_keeps_proportional_quote_at_fair_times_one_minus_edge() -> None:
+    plan = price_moneyline_rfq(
+        request(),
+        fair(probability="0.30"),
+        price_grid=PriceGrid.uniform("0.001"),
+        edge_rate=Decimal("0.02"),
+        maker_fee_multiplier=Decimal("0"),
+    )
+
+    assert plan.yes_bid == Decimal("0.294")
+    assert plan.yes_estimated_fee == Decimal("0")
+    assert plan.yes_edge_rate == Decimal("0.02")
+
+
+def test_missing_market_series_is_derived_and_verified_from_market_ticker() -> None:
+    maker = RFQMaker(
+        client=FakeClient(),  # type: ignore[arg-type]
+        stream=EmptyStream(),
+        fair_book=FakeFairBook(fair()),
+        config=RFQMakerConfig(),
+        audit_log=RecordingAudit(),
+        execute=False,
+    )
+
+    multiplier = asyncio.run(
+        maker._maker_fee_multiplier({}, market_ticker="TEST-SERIES-MARKET")
+    )
+
+    assert multiplier == Decimal("0")
+
+
+def test_parallel_market_setup_singleflights_series_fee_metadata() -> None:
+    client = FakeClient()
+    maker = RFQMaker(
+        client=client,  # type: ignore[arg-type]
+        stream=EmptyStream(),
+        fair_book=FakeFairBook(fair()),
+        config=RFQMakerConfig(),
+        audit_log=RecordingAudit(),
+        execute=False,
+    )
+
+    async def scenario() -> tuple[Decimal, Decimal]:
+        first, second = await asyncio.gather(
+            maker._maker_fee_multiplier(
+                {"series_ticker": "TEST-SERIES"},
+                market_ticker="MARKET-1",
+            ),
+            maker._maker_fee_multiplier(
+                {"series_ticker": "TEST-SERIES"},
+                market_ticker="MARKET-2",
+            ),
+        )
+        return first, second
+
+    assert asyncio.run(scenario()) == (Decimal("0"), Decimal("0"))
+    assert client.series_detail_requests == 1
+
+
 def test_rfq_edge_has_a_hard_two_percent_floor() -> None:
     with pytest.raises(ValueError, match=r"\[2%, 100%\)"):
         price_moneyline_rfq(
@@ -132,6 +209,36 @@ def test_risk_ledger_rejects_fractional_dust_by_default() -> None:
 
     with pytest.raises(ValueError, match="below the minimum"):
         ledger.constrain(plan)
+
+
+def test_session_contract_cap_allows_only_one_total_fill_across_markets() -> None:
+    first_plan = price_moneyline_rfq(
+        request(),
+        fair(),
+        price_grid=PriceGrid.uniform(),
+        edge_rate=Decimal("0.02"),
+    )
+    ledger = RFQRiskLedger(
+        RFQMakerConfig(max_session_contracts=Decimal("1")),
+        available_balance=Decimal("100"),
+    )
+    ledger.reserve(ledger.constrain(first_plan), "quote-1")
+    reservation = ledger.release("rfq-1")
+    assert reservation is not None
+    reservation.accepted_side = "yes"
+    reservation.accepted_contracts = Decimal("1")
+    ledger.record_execution(reservation)
+
+    second_request = replace(request(), rfq_id="rfq-2", ticker="MARKET-2")
+    second_plan = price_moneyline_rfq(
+        second_request,
+        fair(ticker="MARKET-2"),
+        price_grid=PriceGrid.uniform(),
+        edge_rate=Decimal("0.02"),
+    )
+
+    with pytest.raises(ValueError, match="no side"):
+        ledger.constrain(second_plan)
 
 
 def test_json_fair_book_requires_freshness_metadata(tmp_path) -> None:
@@ -302,10 +409,14 @@ class FakeClient:
         self.positions: dict[str, str] = {}
         self.combo_legs: dict[str, list[dict[str, str]]] = {}
         self.collections: dict[str, str] = {}
+        self.fills: list[dict] = []
+        self.retrieved_quotes: list[str] = []
+        self.series_detail_requests = 0
 
     def get_market(self, ticker: str) -> dict:
         market = {
             "ticker": ticker,
+            "series_ticker": "TEST-SERIES",
             "event_ticker": self.market_events[ticker],
             "status": "active",
             "price_ranges": [{"start": "0", "end": "1", "step": "0.01"}],
@@ -314,6 +425,10 @@ class FakeClient:
             market["mve_selected_legs"] = self.combo_legs[ticker]
             market["mve_collection_ticker"] = self.collections[ticker]
         return market
+
+    def get_series_details(self, ticker: str) -> dict:
+        self.series_detail_requests += 1
+        return {"ticker": ticker, "fee_type": "quadratic", "fee_multiplier": 1}
 
     def get_event(self, event_ticker: str) -> dict:
         return {
@@ -327,12 +442,25 @@ class FakeClient:
     def get_balance(self, *, subaccount: int = 0) -> dict:
         return {"balance": 10_000}
 
+    def get_fills(self, **_kwargs) -> list[dict]:
+        return self.fills
+
     def create_rfq_quote(self, **kwargs) -> str:
         self.created.append(kwargs)
         return "quote-1"
 
     def get_rfq_quotes(self, **kwargs) -> list[dict]:
         return self.existing_quotes
+
+    def get_rfq_quote(self, quote_id: str) -> dict:
+        self.retrieved_quotes.append(quote_id)
+        return {
+            "id": quote_id,
+            "rfq_id": "rfq-1",
+            "accepted_side": "yes",
+            "contracts_fp": "1.00",
+            "status": "executed",
+        }
 
     def delete_rfq_quote(self, rfq_id: str, quote_id: str) -> None:
         self.deleted.append((rfq_id, quote_id))
@@ -659,8 +787,43 @@ def test_accepted_risk_is_retained_until_execution() -> None:
     assert any(event == "rfq_reservation_retained" for event, _ in audit.records)
 
 
+def test_execution_recovers_missed_acceptance_before_releasing_risk() -> None:
+    client = FakeClient()
+    audit = RecordingAudit()
+    maker = RFQMaker(
+        client=client,  # type: ignore[arg-type]
+        stream=EmptyStream(),
+        fair_book=FakeFairBook(fair()),
+        config=RFQMakerConfig(),
+        audit_log=audit,
+        execute=True,
+    )
+
+    async def scenario() -> None:
+        await maker.prepare()
+        await maker.handle(created_message())
+        await maker.handle(
+            {
+                "type": "quote_executed",
+                "msg": {
+                    "rfq_id": "rfq-1",
+                    "quote_id": "quote-1",
+                    "order_id": "order-1",
+                },
+            }
+        )
+
+    asyncio.run(scenario())
+
+    assert client.retrieved_quotes == ["quote-1"]
+    assert maker.ledger.positions["MARKET"] == Decimal("1.00")
+    assert maker.ledger.reservations == {}
+    assert any(event == "rfq_quote_executed" for event, _ in audit.records)
+
+
 def test_executed_fill_is_written_to_markdown_ledger(tmp_path) -> None:
     client = FakeClient()
+    client.fills = [{"fee_cost": "0.0010"}]
     audit = RecordingAudit()
     ledger_path = tmp_path / "RFQ_FILLS.md"
     maker = RFQMaker(
@@ -695,10 +858,14 @@ def test_executed_fill_is_written_to_markdown_ledger(tmp_path) -> None:
     assert "2026-07-24T20:00:00Z" in contents
     assert "`MARKET` YES" in contents
     assert "3.6364%" in contents
+    assert "3.4545%" in contents
+    assert "$0.0010" in contents
+    assert "fills_api" in contents
     assert "$0.0200" in contents
     assert "<!-- kalshi-rfq-fill:quote-1 -->" in contents
     executed = [payload for event, payload in audit.records if event == "rfq_quote_executed"]
-    assert executed[0]["edge_rate"] == str(Decimal("0.02") / Decimal("0.55"))
+    assert executed[0]["actual_fee"] == "0.0010"
+    assert executed[0]["net_edge_rate"] == str(Decimal("0.0190") / Decimal("0.55"))
 
 
 def test_executed_parlay_fill_lists_every_leg_and_full_parlay_edge(tmp_path) -> None:
