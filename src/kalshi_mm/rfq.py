@@ -7,7 +7,7 @@ import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -42,6 +42,8 @@ class MoneylineFair:
     observed_at: datetime
     event_start: datetime
     source: str
+    event_ticker: str = ""
+    participants: frozenset[str] = frozenset()
 
     def validate(self) -> None:
         if not ZERO < self.probability < ONE:
@@ -76,12 +78,21 @@ class JsonMoneylineFairBook:
         market_type = str(raw.get("market_type", ""))
         if market_type != "moneyline":
             raise ValueError(f"fair entry for {ticker} is not a moneyline")
+        participants_raw = raw.get("participants", [])
+        if not isinstance(participants_raw, list):
+            raise ValueError(f"{ticker}.participants must be a list")
         fair = MoneylineFair(
             ticker=ticker,
             probability=as_decimal(raw["probability"]),
             observed_at=_parse_time(raw.get("observed_at"), field=f"{ticker}.observed_at"),
             event_start=_parse_time(raw.get("event_start"), field=f"{ticker}.event_start"),
             source=str(raw.get("source", "json-file")),
+            event_ticker=str(raw.get("event_ticker", "")).strip(),
+            participants=frozenset(
+                normalize_name(str(item))
+                for item in participants_raw
+                if normalize_name(str(item))
+            ),
         )
         fair.validate()
         return fair
@@ -187,9 +198,7 @@ class OddsMoneylineFairBook:
         )
         now = datetime.now(UTC)
         odds_events = [
-            event
-            for event in odds_events
-            if event.commence_time > now and self._is_two_way(event)
+            event for event in odds_events if event.commence_time > now and self._is_two_way(event)
         ]
         matches = match_events(
             kalshi_events,
@@ -198,7 +207,16 @@ class OddsMoneylineFairBook:
         )
         refreshed: dict[str, MoneylineFair] = {}
         for match in matches:
-            event_fairs: list[MoneylineFair] = []
+            event_ticker = str(match.kalshi_event.get("event_ticker", "")).strip()
+            participants = frozenset(
+                filter(
+                    None,
+                    (
+                        normalize_name(match.odds_event.home_team),
+                        normalize_name(match.odds_event.away_team),
+                    ),
+                )
+            )
             for market in match.kalshi_event.get("markets", []):
                 ticker = str(market.get("ticker", ""))
                 outcome = str(market.get("yes_sub_title", ""))
@@ -224,16 +242,11 @@ class OddsMoneylineFairBook:
                     observed_at=source_update,
                     event_start=match.odds_event.commence_time,
                     source="odds-consensus:" + ",".join(consensus.bookmaker_keys),
+                    event_ticker=event_ticker,
+                    participants=participants,
                 )
                 fair.validate()
-                event_fairs.append(fair)
-            # Kalshi can expose each team in a two-way game as a separate binary
-            # market. Quoting one market's YES and NO sides already covers both
-            # outcomes, so retain one stable representative and avoid correlated
-            # simultaneous quotes on sibling markets from the same game.
-            if event_fairs:
-                canonical = min(event_fairs, key=lambda item: item.ticker)
-                refreshed[canonical.ticker] = canonical
+                refreshed[fair.ticker] = fair
         if not refreshed:
             raise ValueError("no fresh, safely matched two-way moneyline fairs were found")
         self._values = refreshed
@@ -247,11 +260,49 @@ class OddsMoneylineFairBook:
 
 
 @dataclass(frozen=True, slots=True)
+class RFQLeg:
+    market_ticker: str
+    event_ticker: str
+    side: str
+
+    @classmethod
+    def from_payload(cls, raw: object) -> RFQLeg:
+        if not isinstance(raw, dict):
+            raise ValueError("each MVE leg must be an object")
+        leg = cls(
+            market_ticker=str(raw.get("market_ticker", "")).strip(),
+            event_ticker=str(raw.get("event_ticker", "")).strip(),
+            side=str(raw.get("side", "")).casefold().strip(),
+        )
+        if not leg.market_ticker or not leg.event_ticker or leg.side not in {"yes", "no"}:
+            raise ValueError("each MVE leg requires market_ticker, event_ticker, and YES/NO side")
+        return leg
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "market_ticker": self.market_ticker,
+            "event_ticker": self.event_ticker,
+            "side": self.side,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class RFQRequest:
     rfq_id: str
     ticker: str
-    contracts: Decimal
+    contracts: Decimal | None
     created_at: datetime
+    target_cost: Decimal | None = None
+    collection_ticker: str = ""
+    legs: tuple[RFQLeg, ...] = ()
+
+    @property
+    def is_combo(self) -> bool:
+        return bool(self.collection_ticker or self.legs)
+
+    @property
+    def sizing_mode(self) -> str:
+        return "contracts" if self.contracts is not None else "target_cost"
 
     @classmethod
     def from_message(cls, message: dict[str, Any]) -> RFQRequest:
@@ -260,20 +311,33 @@ class RFQRequest:
         payload = message.get("msg")
         if not isinstance(payload, dict):
             raise ValueError("RFQ message payload is missing")
-        if payload.get("mve_collection_ticker") or payload.get("mve_selected_legs"):
-            raise ValueError("combo RFQs are not supported by the moneyline maker")
         contracts_raw = payload.get("contracts_fp")
-        target_cost = as_decimal(payload.get("target_cost_dollars") or "0")
-        if contracts_raw in {None, ""} or target_cost > ZERO:
-            raise ValueError("only contracts_fp RFQs are supported")
+        target_cost_raw = payload.get("target_cost_dollars")
+        contracts = as_decimal(contracts_raw) if contracts_raw not in {None, ""} else None
+        target_cost = (
+            as_decimal(target_cost_raw)
+            if target_cost_raw not in {None, "", "0", "0.0", "0.00"}
+            else None
+        )
+        if (contracts is None) == (target_cost is None):
+            raise ValueError("RFQ must specify exactly one positive sizing mode")
+        legs_raw = payload.get("mve_selected_legs") or []
+        if not isinstance(legs_raw, list):
+            raise ValueError("mve_selected_legs must be a list")
         request = cls(
             rfq_id=str(payload.get("id", "")),
             ticker=str(payload.get("market_ticker", "")),
-            contracts=as_decimal(contracts_raw),
+            contracts=contracts,
             created_at=_parse_time(payload.get("created_ts"), field="created_ts"),
+            target_cost=target_cost,
+            collection_ticker=str(payload.get("mve_collection_ticker", "")).strip(),
+            legs=tuple(RFQLeg.from_payload(raw) for raw in legs_raw),
         )
-        if not request.rfq_id or not request.ticker or request.contracts <= ZERO:
-            raise ValueError("RFQ ID, ticker, and positive contract size are required")
+        size = request.contracts if request.contracts is not None else request.target_cost
+        if not request.rfq_id or not request.ticker or size is None or size <= ZERO:
+            raise ValueError("RFQ ID, ticker, and positive size are required")
+        if request.is_combo and (not request.collection_ticker or not request.legs):
+            raise ValueError("combo RFQs require both a collection ticker and selected legs")
         return request
 
 
@@ -285,6 +349,7 @@ class RFQQuotePlan:
     no_bid: Decimal
     yes_edge_rate: Decimal | None
     no_edge_rate: Decimal | None
+    leg_fairs: tuple[MoneylineFair, ...] = ()
 
     @property
     def has_side(self) -> bool:
@@ -292,33 +357,67 @@ class RFQQuotePlan:
 
     @property
     def maximum_cost(self) -> Decimal:
-        return max(self.yes_bid, self.no_bid) * self.request.contracts
+        return max(
+            self.yes_bid * self.yes_contracts,
+            self.no_bid * self.no_contracts,
+        )
+
+    @staticmethod
+    def _target_contracts(target_cost: Decimal, bid: Decimal) -> Decimal:
+        if bid <= ZERO:
+            return ZERO
+        # Kalshi derives the exact count. Round up to the next 0.01 contract so
+        # local risk is never smaller than the exchange-derived quote size.
+        return (target_cost / bid).quantize(Decimal("0.01"), rounding=ROUND_CEILING)
+
+    @property
+    def yes_contracts(self) -> Decimal:
+        if self.yes_bid <= ZERO:
+            return ZERO
+        if self.request.contracts is not None:
+            return self.request.contracts
+        assert self.request.target_cost is not None
+        return self._target_contracts(self.request.target_cost, self.yes_bid)
+
+    @property
+    def no_contracts(self) -> Decimal:
+        if self.no_bid <= ZERO:
+            return ZERO
+        if self.request.contracts is not None:
+            return self.request.contracts
+        assert self.request.target_cost is not None
+        return self._target_contracts(self.request.target_cost, self.no_bid)
+
+    def contracts_for(self, side: str) -> Decimal:
+        return self.yes_contracts if side == "yes" else self.no_contracts
 
     def as_dict(self) -> dict[str, object]:
         return {
             "rfq_id": self.request.rfq_id,
             "ticker": self.request.ticker,
-            "contracts_fp": str(self.request.contracts),
+            "sizing_mode": self.request.sizing_mode,
+            "contracts_fp": (
+                str(self.request.contracts) if self.request.contracts is not None else None
+            ),
+            "target_cost_dollars": (
+                str(self.request.target_cost) if self.request.target_cost is not None else None
+            ),
+            "yes_contracts_reserved": str(self.yes_contracts),
+            "no_contracts_reserved": str(self.no_contracts),
+            "collection_ticker": self.request.collection_ticker or None,
+            "legs": [leg.as_dict() for leg in self.request.legs],
             "fair_probability": str(self.fair.probability),
             "fair_observed_at": self.fair.observed_at.isoformat(),
             "fair_source": self.fair.source,
             "yes_bid": str(self.yes_bid),
             "no_bid": str(self.no_bid),
-            "yes_edge_rate": (
-                str(self.yes_edge_rate) if self.yes_edge_rate is not None else None
-            ),
-            "no_edge_rate": (
-                str(self.no_edge_rate) if self.no_edge_rate is not None else None
-            ),
+            "yes_edge_rate": (str(self.yes_edge_rate) if self.yes_edge_rate is not None else None),
+            "no_edge_rate": (str(self.no_edge_rate) if self.no_edge_rate is not None else None),
             "yes_edge_dollars": (
-                str(self.fair.probability - self.yes_bid)
-                if self.yes_bid > ZERO
-                else None
+                str(self.fair.probability - self.yes_bid) if self.yes_bid > ZERO else None
             ),
             "no_edge_dollars": (
-                str(ONE - self.fair.probability - self.no_bid)
-                if self.no_bid > ZERO
-                else None
+                str(ONE - self.fair.probability - self.no_bid) if self.no_bid > ZERO else None
             ),
             "maximum_cost": str(self.maximum_cost),
         }
@@ -330,6 +429,7 @@ def price_moneyline_rfq(
     *,
     price_grid: PriceGrid,
     edge_rate: Decimal,
+    leg_fairs: tuple[MoneylineFair, ...] = (),
 ) -> RFQQuotePlan:
     edge_rate = as_decimal(edge_rate)
     if not HARD_MIN_RFQ_EDGE_RATE <= edge_rate < ONE:
@@ -358,6 +458,7 @@ def price_moneyline_rfq(
         no_bid,
         yes_edge_rate,
         no_edge_rate,
+        leg_fairs,
     )
     if not plan.has_side:
         raise ValueError("fair value is too close to a boundary to quote either side")
@@ -368,7 +469,7 @@ def price_moneyline_rfq(
 class RFQMakerConfig:
     edge_rate: Decimal = HARD_MIN_RFQ_EDGE_RATE
     min_contracts: Decimal = Decimal("1")
-    max_contracts: Decimal = Decimal("1")
+    max_contracts: Decimal = Decimal("10")
     max_abs_position: Decimal = Decimal("10")
     max_notional: Decimal = Decimal("10")
     max_active_quotes: int = 20
@@ -376,6 +477,10 @@ class RFQMakerConfig:
     reconcile_seconds: float = 15
     subaccount: int = 0
     allow_live_games: bool = False
+    min_legs: int = 2
+    max_legs: int = 10
+    max_inflight_rfqs: int = 32
+    max_quote_latency_seconds: float = 1.0
 
     def validate(self) -> None:
         if not HARD_MIN_RFQ_EDGE_RATE <= self.edge_rate < ONE:
@@ -392,6 +497,12 @@ class RFQMakerConfig:
             raise ValueError("RFQ reconciliation interval must be between 1 and 60 seconds")
         if not 0 <= self.subaccount <= 63:
             raise ValueError("RFQ subaccount must be between 0 and 63")
+        if self.min_legs < 2 or self.max_legs < self.min_legs:
+            raise ValueError("RFQ parlay leg limits must start at two and be ordered")
+        if self.max_inflight_rfqs <= 0:
+            raise ValueError("RFQ in-flight handler limit must be positive")
+        if not 0.1 <= self.max_quote_latency_seconds <= 5:
+            raise ValueError("RFQ maximum quote latency must be between 0.1 and 5 seconds")
 
 
 @dataclass(slots=True)
@@ -410,10 +521,9 @@ class MarkdownRFQFillLedger:
     HEADER = (
         "# RFQ Fill Ledger\n\n"
         "This file is updated when the maker observes an executed RFQ. Edge is the modeled\n"
-        "pre-fee edge at confirmation when available, otherwise the quote-time edge. "
-        "Combo/MVE\nRFQs are currently rejected, so current fills are single-leg moneylines "
-        "rather than\nparlays. The `Structure` and `Legs` columns are retained for an explicit "
-        "future parlay\nimplementation.\n\n"
+        "pre-fee edge at confirmation when available, otherwise the quote-time edge. Parlay\n"
+        "fair value is the product of independent selected-leg moneyline probabilities; the\n"
+        "configured proportional edge is applied once to that complete parlay fair value.\n\n"
         "| Executed (UTC) | Structure | Event/game | Legs | Side | Contracts | Fair | Quote | "
         "Edge | Edge/contract | Total modeled edge | RFQ | Quote | Order | Source |\n"
         "| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | "
@@ -442,9 +552,7 @@ class MarkdownRFQFillLedger:
         quote_price = plan.yes_bid if side == "yes" else plan.no_bid
         quote_time_fair = plan.fair.probability if side == "yes" else ONE - plan.fair.probability
         outcome_fair = reservation.confirmed_outcome_fair or quote_time_fair
-        edge_rate = reservation.confirmed_edge_rate or (
-            (outcome_fair - quote_price) / outcome_fair
-        )
+        edge_rate = reservation.confirmed_edge_rate or ((outcome_fair - quote_price) / outcome_fair)
         edge_per_contract = outcome_fair - quote_price
         total_edge = edge_per_contract * contracts
         quote_id = reservation.quote_id
@@ -459,10 +567,19 @@ class MarkdownRFQFillLedger:
             return False
         executed_at = execution.get("executed_ts") or datetime.now(UTC).isoformat()
         order_id = execution.get("order_id") or execution.get("creator_order_id") or "-"
-        legs = f"`{plan.request.ticker}` {side.upper()}"
+        if plan.request.is_combo:
+            structure = "Independent moneyline parlay"
+            event = ", ".join(leg.event_ticker for leg in plan.request.legs)
+            legs = "; ".join(
+                f"`{leg.market_ticker}` {leg.side.upper()}" for leg in plan.request.legs
+            )
+        else:
+            structure = "Single moneyline"
+            event = event_ticker
+            legs = f"`{plan.request.ticker}` {side.upper()}"
         row = (
-            f"| {self._cell(executed_at)} | Single moneyline | "
-            f"{self._cell(event_ticker)} | {legs} | {side.upper()} | {contracts} | "
+            f"| {self._cell(executed_at)} | {structure} | "
+            f"{self._cell(event)} | {legs} | {side.upper()} | {contracts} | "
             f"${outcome_fair:.4f} | ${quote_price:.4f} | {edge_rate:.4%} | "
             f"${edge_per_contract:.4f} | ${total_edge:.4f} | "
             f"{self._cell(plan.request.rfq_id)} | {self._cell(quote_id)} {marker} | "
@@ -493,16 +610,17 @@ class RFQRiskLedger:
         )
 
     def constrain(self, plan: RFQQuotePlan) -> RFQQuotePlan:
-        if plan.request.contracts < self.config.min_contracts:
-            raise ValueError("RFQ size is below the minimum contract limit")
-        if plan.request.contracts > self.config.max_contracts:
-            raise ValueError("RFQ size exceeds the per-request contract limit")
+        if plan.request.contracts is not None:
+            if plan.request.contracts < self.config.min_contracts:
+                raise ValueError("RFQ size is below the minimum contract limit")
+            if plan.request.contracts > self.config.max_contracts:
+                raise ValueError("RFQ size exceeds the per-request contract limit")
         if len(self.reservations) >= self.config.max_active_quotes:
             raise ValueError("active RFQ quote limit reached")
         position = self.positions.get(plan.request.ticker, ZERO)
         long_reserve = sum(
             (
-                item.plan.request.contracts
+                item.plan.yes_contracts
                 for item in self.reservations.values()
                 if item.plan.request.ticker == plan.request.ticker and item.plan.yes_bid > ZERO
             ),
@@ -510,7 +628,7 @@ class RFQRiskLedger:
         )
         short_reserve = sum(
             (
-                item.plan.request.contracts
+                item.plan.no_contracts
                 for item in self.reservations.values()
                 if item.plan.request.ticker == plan.request.ticker and item.plan.no_bid > ZERO
             ),
@@ -518,14 +636,20 @@ class RFQRiskLedger:
         )
         yes_bid = plan.yes_bid
         no_bid = plan.no_bid
+        yes_contracts = plan.yes_contracts
+        no_contracts = plan.no_contracts
         if (
-            yes_bid * plan.request.contracts > self.config.max_notional
-            or position + long_reserve + plan.request.contracts > self.config.max_abs_position
+            yes_contracts < self.config.min_contracts
+            or yes_contracts > self.config.max_contracts
+            or yes_bid * yes_contracts > self.config.max_notional
+            or position + long_reserve + yes_contracts > self.config.max_abs_position
         ):
             yes_bid = ZERO
         if (
-            no_bid * plan.request.contracts > self.config.max_notional
-            or position - short_reserve - plan.request.contracts < -self.config.max_abs_position
+            no_contracts < self.config.min_contracts
+            or no_contracts > self.config.max_contracts
+            or no_bid * no_contracts > self.config.max_notional
+            or position - short_reserve - no_contracts < -self.config.max_abs_position
         ):
             no_bid = ZERO
         constrained = replace(
@@ -588,6 +712,7 @@ class RFQMaker:
         execute: bool,
         fill_ledger: MarkdownRFQFillLedger | None = None,
         allowed_tickers: set[str] | None = None,
+        allowed_collections: set[str] | None = None,
     ) -> None:
         config.validate()
         self.client = client
@@ -598,6 +723,7 @@ class RFQMaker:
         self.fill_ledger = fill_ledger
         self.execute = execute
         self.allowed_tickers = set(allowed_tickers or ())
+        self.allowed_collections = set(allowed_collections or ())
         self.price_grids: dict[str, PriceGrid] = {}
         self.event_tickers: dict[str, str] = {}
         self.event_markets: dict[str, tuple[str, ...]] = {}
@@ -634,17 +760,19 @@ class RFQMaker:
         payload = message.get("msg")
         if not isinstance(payload, dict):
             return None
-        if payload.get("mve_collection_ticker") or payload.get("mve_selected_legs"):
-            return "combo RFQs are not supported by the moneyline maker"
-        contracts_raw = payload.get("contracts_fp")
         try:
-            target_cost = as_decimal(payload.get("target_cost_dollars") or "0")
+            request = RFQRequest.from_message(message)
         except (InvalidOperation, TypeError, ValueError):
+            return "invalid RFQ shape"
+        if not request.is_combo:
+            if not self._ticker_allowed(request.ticker):
+                return "ticker is not on the moneyline allowlist"
             return None
-        if contracts_raw in {None, ""} or target_cost > ZERO:
-            return "only contracts_fp RFQs are supported"
-        ticker = str(payload.get("market_ticker", ""))
-        if ticker and not self._ticker_allowed(ticker):
+        if self.allowed_collections and request.collection_ticker not in self.allowed_collections:
+            return "MVE collection is not on the allowlist"
+        if not self.config.min_legs <= len(request.legs) <= self.config.max_legs:
+            return "parlay leg count is outside configured limits"
+        if any(not self._ticker_allowed(leg.market_ticker) for leg in request.legs):
             return "ticker is not on the moneyline allowlist"
         return None
 
@@ -660,23 +788,26 @@ class RFQMaker:
         outcome_fair = reservation.confirmed_outcome_fair
         if outcome_fair is None and side in {"yes", "no"}:
             outcome_fair = plan.fair.probability if side == "yes" else ONE - plan.fair.probability
-        quoted_price = (
-            plan.yes_bid
-            if side == "yes"
-            else plan.no_bid
-            if side == "no"
-            else None
-        )
+        quoted_price = plan.yes_bid if side == "yes" else plan.no_bid if side == "no" else None
         edge_rate = reservation.confirmed_edge_rate
         if edge_rate is None and outcome_fair and quoted_price is not None:
             edge_rate = (outcome_fair - quoted_price) / outcome_fair
+        if plan.request.is_combo:
+            event_ticker = ",".join(leg.event_ticker for leg in plan.request.legs)
+            structure = "independent_moneyline_parlay"
+            legs = [f"{leg.market_ticker}:{leg.side}" for leg in plan.request.legs]
+        else:
+            event_ticker = self.event_tickers.get(plan.request.ticker, "")
+            structure = "single_moneyline"
+            legs = [f"{plan.request.ticker}:{side or 'unknown'}"]
         payload: dict[str, object] = {
             "rfq_id": plan.request.rfq_id,
             "quote_id": reservation.quote_id,
             "ticker": plan.request.ticker,
-            "event_ticker": self.event_tickers.get(plan.request.ticker, ""),
-            "structure": "single_moneyline",
-            "legs": [f"{plan.request.ticker}:{side or 'unknown'}"],
+            "event_ticker": event_ticker,
+            "structure": structure,
+            "collection_ticker": plan.request.collection_ticker or None,
+            "legs": legs,
             "accepted_side": side,
             "contracts_fp": str(reservation.accepted_contracts),
             "outcome_fair": str(outcome_fair) if outcome_fair is not None else None,
@@ -687,9 +818,7 @@ class RFQMaker:
                 if outcome_fair is not None and quoted_price is not None
                 else None
             ),
-            "order_id": str(
-                execution.get("order_id") or execution.get("creator_order_id") or ""
-            ),
+            "order_id": str(execution.get("order_id") or execution.get("creator_order_id") or ""),
             "executed_ts": str(execution.get("executed_ts") or ""),
             "reconciled": reconciled,
         }
@@ -697,7 +826,7 @@ class RFQMaker:
             try:
                 self.fill_ledger.append(
                     reservation,
-                    event_ticker=self.event_tickers.get(plan.request.ticker, ""),
+                    event_ticker=event_ticker,
                     execution=execution,
                 )
             except Exception as exc:
@@ -728,7 +857,63 @@ class RFQMaker:
             return ticker in self.allowed_tickers
         return ticker in self.fair_book.tickers()
 
-    async def _ensure_market(self, ticker: str) -> PriceGrid:
+    def _request_fair(
+        self,
+        request: RFQRequest,
+        *,
+        now: datetime | None = None,
+    ) -> tuple[MoneylineFair, tuple[MoneylineFair, ...]]:
+        if not request.is_combo:
+            if not self._ticker_allowed(request.ticker):
+                raise ValueError("ticker is not on the moneyline allowlist")
+            return self._fair(request.ticker, now=now), ()
+        if self.allowed_collections and request.collection_ticker not in self.allowed_collections:
+            raise ValueError("MVE collection is not on the allowlist")
+        if not self.config.min_legs <= len(request.legs) <= self.config.max_legs:
+            raise ValueError("parlay leg count is outside configured limits")
+        market_tickers = [leg.market_ticker for leg in request.legs]
+        event_tickers = [leg.event_ticker for leg in request.legs]
+        if len(set(market_tickers)) != len(market_tickers):
+            raise ValueError("parlay repeats a market")
+        if len(set(event_tickers)) != len(event_tickers):
+            raise ValueError("same-game parlay legs are not independent")
+
+        probability = ONE
+        leg_fairs: list[MoneylineFair] = []
+        seen_participants: set[str] = set()
+        for leg in request.legs:
+            if not self._ticker_allowed(leg.market_ticker):
+                raise ValueError("parlay leg ticker is not on the moneyline allowlist")
+            fair = self._fair(leg.market_ticker, now=now)
+            if not fair.event_ticker:
+                raise ValueError("parlay leg fair is missing an event ticker")
+            if fair.event_ticker != leg.event_ticker:
+                raise ValueError("parlay leg event does not match its fair-value event")
+            if len(fair.participants) < 2:
+                raise ValueError("parlay leg fair is missing participant identities")
+            overlap = seen_participants.intersection(fair.participants)
+            if overlap:
+                raise ValueError(
+                    "parlay legs share a participant and are not independent: "
+                    + ", ".join(sorted(overlap))
+                )
+            seen_participants.update(fair.participants)
+            probability *= fair.probability if leg.side == "yes" else ONE - fair.probability
+            leg_fairs.append(fair)
+
+        aggregate = MoneylineFair(
+            ticker=request.ticker,
+            probability=probability,
+            observed_at=min(item.observed_at for item in leg_fairs),
+            event_start=min(item.event_start for item in leg_fairs),
+            source="parlay-product:" + ",".join(sorted({item.source for item in leg_fairs})),
+            event_ticker=",".join(event_tickers),
+            participants=frozenset(seen_participants),
+        )
+        aggregate.validate()
+        return aggregate, tuple(leg_fairs)
+
+    async def _ensure_leg_market(self, ticker: str) -> PriceGrid:
         existing = self.price_grids.get(ticker)
         if existing is not None:
             return existing
@@ -788,24 +973,72 @@ class RFQMaker:
                 )
         grid = PriceGrid.from_market(market)
         async with self._lock:
-            same_event_ticker = next(
-                (
-                    other_ticker
-                    for other_ticker, other_event in self.event_tickers.items()
-                    if other_event == event_ticker and other_ticker != ticker
-                ),
-                None,
-            )
-            if same_event_ticker is not None:
-                raise ValueError(
-                    "correlated quote universe contains multiple markets from event "
-                    f"{event_ticker}: {same_event_ticker}, {ticker}"
-                )
             self.price_grids[ticker] = grid
             self.event_tickers[ticker] = event_ticker
             self.event_markets[event_ticker] = event_market_tickers
             self.ledger.positions[ticker] = as_decimal(position)
         return grid
+
+    async def _ensure_quote_market(self, request: RFQRequest) -> PriceGrid:
+        if not request.is_combo:
+            return await self._ensure_leg_market(request.ticker)
+        existing = self.price_grids.get(request.ticker)
+        if existing is not None:
+            return existing
+        market, position = await asyncio.gather(
+            asyncio.to_thread(self.client.get_market, request.ticker),
+            asyncio.to_thread(
+                self.client.get_position,
+                request.ticker,
+                subaccount=self.config.subaccount,
+            ),
+        )
+        if str(market.get("status", "")) not in {"active", "open"}:
+            raise ValueError("combo market is not active")
+        actual_collection = str(market.get("mve_collection_ticker", "")).strip()
+        if actual_collection and actual_collection != request.collection_ticker:
+            raise ValueError("combo market collection does not match the RFQ")
+        actual_legs_raw = market.get("mve_selected_legs")
+        if not isinstance(actual_legs_raw, list):
+            raise ValueError("combo market is missing selected-leg metadata")
+        actual_legs = {
+            (
+                str(item.get("market_ticker", "")).strip(),
+                str(item.get("event_ticker", "")).strip(),
+                str(item.get("side", "")).casefold().strip(),
+            )
+            for item in actual_legs_raw
+            if isinstance(item, dict)
+        }
+        requested_legs = {(leg.market_ticker, leg.event_ticker, leg.side) for leg in request.legs}
+        if actual_legs != requested_legs:
+            raise ValueError("combo market selected legs do not match the RFQ")
+        grid = PriceGrid.from_market(market)
+        async with self._lock:
+            self.price_grids[request.ticker] = grid
+            self.event_tickers[request.ticker] = str(market.get("event_ticker", ""))
+            self.ledger.positions[request.ticker] = as_decimal(position)
+        return grid
+
+    def _ensure_no_overlapping_reservation(self, request: RFQRequest) -> None:
+        requested_events = (
+            {leg.event_ticker for leg in request.legs}
+            if request.is_combo
+            else {self.event_tickers.get(request.ticker, "")}
+        )
+        requested_events.discard("")
+        for reservation in self.ledger.reservations.values():
+            other = reservation.plan.request
+            other_events = (
+                {leg.event_ticker for leg in other.legs}
+                if other.is_combo
+                else {self.event_tickers.get(other.ticker, "")}
+            )
+            overlap = requested_events.intersection(other_events)
+            if overlap:
+                raise ValueError(
+                    "active RFQ exposure overlaps an event: " + ", ".join(sorted(overlap))
+                )
 
     async def prepare(self) -> None:
         tickers = await asyncio.to_thread(self.fair_book.refresh)
@@ -838,15 +1071,13 @@ class RFQMaker:
         )
         available_cents = as_decimal(balance.get("balance", "0"))
         self.ledger.available_balance = available_cents / Decimal("100")
-        await asyncio.gather(*(self._ensure_market(ticker) for ticker in selected))
+        await asyncio.gather(*(self._ensure_leg_market(ticker) for ticker in selected))
         self._audit(
             "rfq_maker_ready",
             {
                 "execute": self.execute,
                 "tickers": list(selected),
-                "event_tickers": {
-                    ticker: self.event_tickers[ticker] for ticker in selected
-                },
+                "event_tickers": {ticker: self.event_tickers[ticker] for ticker in selected},
                 "edge_rate": str(self.config.edge_rate),
                 "max_fair_age_seconds": self.config.max_fair_age_seconds,
                 "available_balance": str(self.ledger.available_balance),
@@ -858,29 +1089,48 @@ class RFQMaker:
         reservation_created = False
         retain_reservation_on_error = False
         try:
+            if time.monotonic() - received_at > self.config.max_quote_latency_seconds:
+                raise ValueError("RFQ exceeded the maximum quote latency")
             request = RFQRequest.from_message(message)
-            if not self._ticker_allowed(request.ticker):
-                raise ValueError("ticker is not on the moneyline allowlist")
-            fair = self._fair(request.ticker)
-            grid = await self._ensure_market(request.ticker)
+            if request.is_combo:
+                await asyncio.gather(
+                    *(self._ensure_leg_market(leg.market_ticker) for leg in request.legs)
+                )
+                mismatched = [
+                    leg.market_ticker
+                    for leg in request.legs
+                    if self.event_tickers.get(leg.market_ticker) != leg.event_ticker
+                ]
+                if mismatched:
+                    raise ValueError(
+                        "parlay leg event metadata does not match Kalshi: "
+                        + ", ".join(sorted(mismatched))
+                    )
+            fair, leg_fairs = self._request_fair(request)
+            grid = await self._ensure_quote_market(request)
             plan = price_moneyline_rfq(
                 request,
                 fair,
                 price_grid=grid,
                 edge_rate=self.config.edge_rate,
+                leg_fairs=leg_fairs,
             )
             async with self._lock:
+                self._ensure_no_overlapping_reservation(request)
                 plan = self.ledger.constrain(plan)
                 if request.rfq_id in self.closed_rfqs:
                     raise ValueError("RFQ closed before quote submission")
                 quote_id = (
-                    f"pending:{request.rfq_id}"
-                    if self.execute
-                    else f"dry-run:{request.rfq_id}"
+                    f"pending:{request.rfq_id}" if self.execute else f"dry-run:{request.rfq_id}"
                 )
                 self.ledger.reserve(plan, quote_id)
                 reservation_created = True
             if self.execute:
+                if time.monotonic() - received_at > self.config.max_quote_latency_seconds:
+                    async with self._lock:
+                        self.ledger.release(request.rfq_id)
+                    reservation_created = False
+                    raise ValueError("RFQ exceeded the maximum quote latency")
                 # A lost HTTP response is ambiguous: the quote may exist. Keep its
                 # risk reserved until Kalshi emits rfq_deleted rather than overquote.
                 retain_reservation_on_error = True
@@ -916,11 +1166,7 @@ class RFQMaker:
                 {**plan.as_dict(), "quote_id": quote_id, "latency_ms": round(elapsed_ms, 3)},
             )
         except Exception as exc:
-            if (
-                reservation_created
-                and not retain_reservation_on_error
-                and request is not None
-            ):
+            if reservation_created and not retain_reservation_on_error and request is not None:
                 async with self._lock:
                     self.ledger.release(request.rfq_id)
             payload = message.get("msg") if isinstance(message.get("msg"), dict) else {}
@@ -949,18 +1195,17 @@ class RFQMaker:
             if side not in {"yes", "no"}:
                 raise ValueError("accepted RFQ side is invalid")
             count = as_decimal(payload.get("contracts_accepted_fp", "0"))
-            if count <= ZERO or count > reservation.plan.request.contracts:
+            if count <= ZERO or count > reservation.plan.contracts_for(side):
                 raise ValueError("accepted RFQ size exceeds the reserved quote")
             quoted_price = reservation.plan.yes_bid if side == "yes" else reservation.plan.no_bid
             if quoted_price <= ZERO:
                 raise ValueError("customer accepted a disabled RFQ side")
-            fair = self._fair(reservation.plan.request.ticker)
+            fair, _ = self._request_fair(reservation.plan.request)
             outcome_fair = fair.probability if side == "yes" else ONE - fair.probability
             current_edge_rate = (outcome_fair - quoted_price) / outcome_fair
             if current_edge_rate < self.config.edge_rate:
                 raise ValueError(
-                    "fair value moved through the minimum proportional edge "
-                    "before confirmation"
+                    "fair value moved through the minimum proportional edge before confirmation"
                 )
             if not self.execute:
                 raise ValueError("dry-run quotes cannot be confirmed")
@@ -1099,7 +1344,9 @@ class RFQMaker:
                 if accepted_side in {"yes", "no"} and reservation.accepted_side is None:
                     reservation.accepted_side = accepted_side
                     reservation.accepted_contracts = as_decimal(
-                        quote.get("contracts_fp") or reservation.plan.request.contracts
+                        quote.get("contracts_fp")
+                        or quote.get(f"{accepted_side}_contracts_fp")
+                        or reservation.plan.contracts_for(accepted_side)
                     )
                 terminal = bool(quote.get("executed_ts") or quote.get("cancelled_ts")) or (
                     status in {"executed", "cancelled", "expired", "closed"}
@@ -1231,11 +1478,7 @@ class RFQMaker:
                 continue
             payload = message.get("msg")
             payload = payload if isinstance(payload, dict) else {}
-            rfq_id = str(
-                payload.get("rfq_id")
-                or payload.get("id")
-                or f"unkeyed:{seen}"
-            )
+            rfq_id = str(payload.get("rfq_id") or payload.get("id") or f"unkeyed:{seen}")
             seen += 1
             if message_type == "rfq_created":
                 rejection = self._prefilter_created(message)
@@ -1244,10 +1487,12 @@ class RFQMaker:
                     if max_messages and seen >= max_messages:
                         return
                     continue
-            elif (
-                rfq_id not in self._rfq_tails
-                and rfq_id not in self.ledger.reservations
-            ):
+                if len(self._tasks) >= self.config.max_inflight_rfqs:
+                    self._record_unsupported("RFQ handler capacity reached")
+                    if max_messages and seen >= max_messages:
+                        return
+                    continue
+            elif rfq_id not in self._rfq_tails and rfq_id not in self.ledger.reservations:
                 if max_messages and seen >= max_messages:
                     return
                 continue
@@ -1280,9 +1525,7 @@ class RFQMaker:
     async def run(self, *, seconds: float = 0, max_messages: int = 0) -> None:
         await self.prepare()
         refresh_task = asyncio.create_task(self._refresh_fairs())
-        reconcile_task = (
-            asyncio.create_task(self._reconcile_quotes()) if self.execute else None
-        )
+        reconcile_task = asyncio.create_task(self._reconcile_quotes()) if self.execute else None
         try:
             if seconds > 0:
                 with contextlib.suppress(TimeoutError):

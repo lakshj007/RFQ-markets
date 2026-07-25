@@ -1073,8 +1073,10 @@ def _rfq_client(args: argparse.Namespace) -> tuple[KalshiClient, bool, bool]:
                 "set KALSHI_RFQ_LIVE_ENABLED=I_UNDERSTAND_RFQ_REAL_MONEY "
                 "for production RFQ execution"
             )
-        if not args.allow_ticker:
-            raise ValueError("production RFQ execution requires at least one --allow-ticker")
+        if not args.allow_ticker and not args.allow_collection:
+            raise ValueError(
+                "production RFQ execution requires --allow-ticker or --allow-collection"
+            )
         return _production_client(), False, True
     if args.demo:
         return KalshiClient.from_env(demo=True), True, False
@@ -1130,11 +1132,16 @@ def _cmd_rfq_maker(args: argparse.Namespace) -> None:
             reconcile_seconds=args.reconcile_seconds,
             subaccount=args.subaccount,
             allow_live_games=args.allow_live,
+            min_legs=args.min_legs,
+            max_legs=args.max_legs,
+            max_inflight_rfqs=args.max_inflight_rfqs,
+            max_quote_latency_seconds=args.max_quote_latency,
         ),
         audit_log=_RFQAudit(args.audit_log, json_output=args.json),
         execute=execute,
         fill_ledger=MarkdownRFQFillLedger(args.fill_ledger),
         allowed_tickers=set(args.allow_ticker or ()),
+        allowed_collections=set(args.allow_collection or ()),
     )
     mode = (
         "production execution"
@@ -1470,9 +1477,14 @@ def build_parser() -> argparse.ArgumentParser:
     fair.add_argument("--odds-match-window-hours", type=float, default=6)
     pricing = rfq.add_argument_group("pricing and risk")
     pricing.add_argument("--allow-ticker", action="append", default=[])
+    pricing.add_argument("--allow-collection", action="append", default=[])
     pricing.add_argument("--edge-percent", type=_decimal, default=Decimal("2"))
     pricing.add_argument("--min-contracts", type=_decimal, default=Decimal("1"))
-    pricing.add_argument("--max-contracts", type=_decimal, default=Decimal("1"))
+    pricing.add_argument("--max-contracts", type=_decimal, default=Decimal("10"))
+    pricing.add_argument("--min-legs", type=int, default=2)
+    pricing.add_argument("--max-legs", type=int, default=10)
+    pricing.add_argument("--max-inflight-rfqs", type=int, default=32)
+    pricing.add_argument("--max-quote-latency", type=float, default=1.0)
     pricing.add_argument("--max-position", type=_decimal, default=Decimal("10"))
     pricing.add_argument("--max-notional", type=_decimal, default=Decimal("10"))
     pricing.add_argument("--max-active-quotes", type=int, default=20)

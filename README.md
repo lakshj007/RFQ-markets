@@ -3,8 +3,9 @@
 This repository is a dry-run-first implementation for exploring Kalshi sports markets
 and generating two-sided quotes. Public-order-book market making remains restricted to
 Kalshi's demo environment. A separate RFQ maker can quote and auto-confirm production
-moneyline RFQs behind explicit credentials, ticker allowlists, acknowledgements, fresh
-external fair values, and bounded exposure. In-play RFQs remain disabled by default.
+moneyline and independent-moneyline-parlay RFQs behind explicit credentials,
+collection/ticker allowlists, acknowledgements, fresh external fair values, and bounded
+exposure. In-play RFQs remain disabled by default.
 
 The implementation targets the API shape documented in June 2026:
 
@@ -201,6 +202,20 @@ and 1.4 cents respectively. This is proportional price edge before exchange fees
 fee rounding; increase `--edge-percent` if the required return must be net of those
 costs.
 
+For a combo/MVE, each selected leg contributes `p_i` for a YES leg or `1 - p_i` for a
+NO leg. Only after calculating the complete parlay fair `P = product(selected p_i)` does
+the maker apply the edge:
+
+```text
+parlay_yes_bid <= P × (1 - e)
+parlay_no_bid  <= (1 - P) × (1 - e)
+```
+
+The edge is therefore on the customer's finished parlay, not separately compounded on
+each leg. Both bids remain prices per contract. The quote implicitly covers the RFQ's
+full `contracts_fp` size or the side-specific contract count Kalshi derives from
+`target_cost_dollars`.
+
 The fast external-feed interface is an atomically replaced JSON file. Each entry must
 explicitly identify a fresh, pregame moneyline:
 
@@ -211,6 +226,8 @@ explicitly identify a fresh, pregame moneyline:
       "probability": "0.55",
       "observed_at": "2026-07-24T18:30:00Z",
       "event_start": "2026-07-24T23:10:00Z",
+      "event_ticker": "KXMLBGAME-26JUL24TEAMATEAMB",
+      "participants": ["Team A", "Team B"],
       "market_type": "moneyline",
       "source": "your-low-latency-feed"
     }
@@ -219,7 +236,9 @@ explicitly identify a fresh, pregame moneyline:
 ```
 
 The file is cached and checked for updates every 250ms by default; an RFQ reads the
-in-memory snapshot. First run against demo RFQs without writing quotes:
+in-memory snapshot. `event_ticker` and `participants` are mandatory for parlay legs so
+same-game and repeated-team combinations can fail closed. First run against demo RFQs
+without writing quotes:
 
 ```bash
 kalshi-mm rfq-maker \
@@ -229,7 +248,7 @@ kalshi-mm rfq-maker \
   --edge-percent 2 \
   --max-fair-age 5 \
   --min-contracts 1 \
-  --max-contracts 1 \
+  --max-contracts 10 \
   --seconds 60
 ```
 
@@ -256,20 +275,25 @@ kalshi-mm rfq-maker \
 ```
 
 Production execution requires production-only Kalshi credentials, at least one exact
-ticker allowlist entry, an ephemeral enable variable, and the exact acknowledgement:
+ticker or MVE collection allowlist entry, an ephemeral enable variable, and the exact
+acknowledgement:
 
 ```bash
 export KALSHI_RFQ_LIVE_ENABLED='I_UNDERSTAND_RFQ_REAL_MONEY'
 
 kalshi-mm rfq-maker \
   --fair-file rfq-fairs.json \
-  --allow-ticker KALSHI-MARKET-TICKER \
+  --allow-collection KALSHI-MVE-COLLECTION \
   --edge-percent 2 \
   --max-fair-age 5 \
   --min-contracts 1 \
-  --max-contracts 1 \
-  --max-position 2 \
-  --max-notional 1 \
+  --max-contracts 10 \
+  --min-legs 2 \
+  --max-legs 6 \
+  --max-inflight-rfqs 32 \
+  --max-quote-latency 1 \
+  --max-position 10 \
+  --max-notional 5 \
   --execute-live \
   --acknowledge-risk REAL_MONEY_RFQ_AUTOCONFIRM
 
@@ -295,33 +319,41 @@ does not silently omit the fill.
 1. Refresh and safely match pregame moneyline fair values before handling RFQs. JSON
    feeds are checked every 250ms; the Odds API source refreshes on its configured
    interval.
-2. Receive `rfq_created` on the authenticated `communications` WebSocket and reject
-   non-moneylines, combos, target-cost requests, stale fairs, disallowed tickers, and
-   sizes outside the configured limits.
-3. Calculate both outcome bids as `outcome_fair × (1 - edge_rate)`, then round each bid
-   down to the market's valid price grid. Rounding down can only increase our edge.
-4. Reserve worst-case balance and directional inventory locally, then submit the quote
-   through `POST /communications/quotes`.
-5. On `quote_accepted`, reload the latest cached fair and recompute the proportional
-   edge for the accepted side. Confirm only if the full configured percentage remains.
-6. Retain the exposure reservation through Kalshi's execution timer, reconcile it from
-   quote and portfolio state, and release it after execution or cancellation.
-7. Cancel all unaccepted quotes on clean shutdown; refuse a new executable session if
+2. Receive `rfq_created` on the authenticated `communications` WebSocket. For a combo,
+   require an allowed MVE collection, configured leg count, fresh supported moneyline
+   fair for every selected leg, and exact selected-leg agreement with Kalshi's combo
+   market metadata.
+3. Reject repeated markets, repeated Kalshi `event_ticker` values, shared normalized
+   participant identities, in-play legs, sibling-event positions, and overlap with any
+   active quote reservation. Missing correlation metadata is a rejection, not an
+   assumption of independence.
+4. Convert every leg to its selected-side probability and multiply them once. Calculate
+   both combo outcome bids as `outcome_fair × (1 - edge_rate)`, then round down to the
+   combo market's valid price grid. Rounding down can only increase our edge.
+5. Resolve fixed-size requests directly. For target-cost requests, conservatively round
+   each side's derived size up to the next 0.01 contract for local risk checks. Disable
+   a side if its size, position, notional, or balance limit would be exceeded.
+6. Reserve worst-case balance and directional inventory locally, then submit the quote
+   through `POST /communications/quotes`. At most 32 RFQs are processed concurrently
+   by default; excess burst traffic and any request delayed over one second are dropped
+   fail-closed instead of building a stale work queue.
+7. On `quote_accepted`, validate the exchange-reported accepted count, reload every
+   latest leg fair, rebuild the full parlay fair, and confirm only if the configured
+   proportional edge still remains.
+8. Retain the exposure reservation through Kalshi's execution timer, reconcile it from
+   quote and portfolio state, and release it after execution or cancellation. Record
+   every observed fill, its legs, quote, fair, percentage edge, and modeled dollar edge
+   in `RFQ_FILLS.md`.
+9. Cancel all unaccepted quotes on clean shutdown; refuse a new executable session if
    unresolved quotes from an earlier process still exist.
 
-The initial scope intentionally rejects combo RFQs and `target_cost_dollars` RFQs. It
-quotes only `contracts_fp` requests for explicitly cached two-outcome moneylines.
-
-Correlation checks are fail-closed. Every allowed market must resolve to a Kalshi
-`event_ticker`, and startup rejects a fair-value universe containing more than one
-market from the same event/game. The Odds API source deterministically retains one
-canonical Kalshi market per two-way game because that market's YES and NO bids already
-cover both moneyline outcomes. It also loads every sibling market in that event and
-refuses to quote when the account already has a nonzero position in any sibling. Combo
-and MVE RFQs remain unsupported, so the maker never prices a multi-leg request. These
-guards enforce structural same-game separation; they do not claim that markets from
-different events are statistically independent when they share broader team, weather,
-season, or tournament risk.
+Correlation checks are fail-closed and structural. Every parlay leg must belong to a
+different Kalshi event and have a participant set disjoint from every other leg. The
+Odds API source retains both team markets for a two-way game so either can be selected,
+while the combo validator prevents those siblings from appearing together. These
+checks block same-game parlays and repeated teams; they cannot mathematically prove
+independence from shared weather, venue, tournament, or other latent risks, so supported
+series and collection allowlists should remain narrow.
 
 ## Guarded production order
 
