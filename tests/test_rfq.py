@@ -541,6 +541,15 @@ class RejectedDeleteClient(FakeClient):
         raise KalshiAPIError(409, "DELETE", "/communications/quotes", "quote accepted")
 
 
+class MissingDeleteClient(FakeClient):
+    def delete_rfq_quote(self, rfq_id: str, quote_id: str) -> None:
+        self.deleted.append((rfq_id, quote_id))
+        raise KalshiAPIError(404, "DELETE", "/communications/quotes", "not found")
+
+    def get_rfq_quote(self, quote_id: str) -> dict:
+        raise KalshiAPIError(404, "GET", f"/communications/quotes/{quote_id}", "not found")
+
+
 def created_message() -> dict:
     return {
         "type": "rfq_created",
@@ -1175,6 +1184,7 @@ def test_unaccepted_quote_ttl_retains_risk_when_delete_fails() -> None:
         reservation = maker.ledger.reservations["rfq-1"]
         assert reservation.submitted_at_monotonic is not None
         await maker._expire_unaccepted_once(now=reservation.submitted_at_monotonic + 60)
+        await maker._expire_unaccepted_once(now=reservation.submitted_at_monotonic + 61)
 
     asyncio.run(scenario())
 
@@ -1184,6 +1194,74 @@ def test_unaccepted_quote_ttl_retains_risk_when_delete_fails() -> None:
         payload for event, payload in audit.records if event == "rfq_quote_ttl_cancel_failed"
     ]
     assert failed[0]["risk_reserved"] is True
+
+
+def test_unaccepted_quote_ttl_reconciles_a_missing_quote_after_404(monkeypatch) -> None:
+    client = MissingDeleteClient()
+    audit = RecordingAudit()
+    sleeps: list[float] = []
+
+    async def record_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("kalshi_mm.rfq.asyncio.sleep", record_sleep)
+    maker = RFQMaker(
+        client=client,  # type: ignore[arg-type]
+        stream=EmptyStream(),
+        fair_book=FakeFairBook(fair()),
+        config=RFQMakerConfig(max_unaccepted_quote_age_seconds=60),
+        audit_log=audit,
+        execute=True,
+    )
+
+    async def scenario() -> None:
+        await maker.prepare()
+        await maker.handle(created_message())
+        reservation = maker.ledger.reservations["rfq-1"]
+        assert reservation.submitted_at_monotonic is not None
+        await maker._expire_unaccepted_once(now=reservation.submitted_at_monotonic + 60)
+
+    asyncio.run(scenario())
+
+    assert client.deleted == [("rfq-1", "quote-1")]
+    assert maker.ledger.reservations == {}
+    assert sleeps == [46.0]
+    assert any(event == "rfq_quote_ttl_reconciled_absent" for event, _ in audit.records)
+
+
+def test_missing_combo_quote_waits_through_hvm_execution_window(monkeypatch) -> None:
+    client = MissingDeleteClient()
+    configure_combo(client)
+    sleeps: list[float] = []
+
+    async def record_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("kalshi_mm.rfq.asyncio.sleep", record_sleep)
+    maker = RFQMaker(
+        client=client,  # type: ignore[arg-type]
+        stream=EmptyStream(),
+        fair_book=MultiFairBook(combo_fairs()),
+        config=RFQMakerConfig(
+            max_unaccepted_quote_age_seconds=60,
+            combo_only=True,
+        ),
+        audit_log=RecordingAudit(),
+        execute=True,
+        allowed_collections={"COMBO-COLLECTION"},
+    )
+
+    async def scenario() -> None:
+        await maker.prepare()
+        await maker.handle(combo_message())
+        reservation = maker.ledger.reservations["rfq-1"]
+        assert reservation.submitted_at_monotonic is not None
+        await maker._expire_unaccepted_once(now=reservation.submitted_at_monotonic + 60)
+
+    asyncio.run(scenario())
+
+    assert sleeps == [5.0]
+    assert maker.ledger.reservations == {}
 
 
 def test_run_aggregates_unsupported_rfqs_without_creating_tasks() -> None:

@@ -350,9 +350,10 @@ class KalshiClient:
         )["quote"]
 
     def delete_rfq_quote(self, rfq_id: str, quote_id: str) -> None:
+        del rfq_id
         self._request(
             "DELETE",
-            f"/communications/rfqs/{rfq_id}/quotes/{quote_id}",
+            f"/communications/quotes/{quote_id}",
             authenticated=True,
         )
 

@@ -1042,6 +1042,7 @@ class _RFQAudit:
             "rfq_quote_ttl_cancelled",
             "rfq_quote_ttl_cancel_failed",
             "rfq_quote_ttl_loop_failed",
+            "rfq_quote_ttl_reconciled_absent",
             "rfq_quote_confirmed",
             "rfq_quote_executed",
             "rfq_quote_ambiguous",

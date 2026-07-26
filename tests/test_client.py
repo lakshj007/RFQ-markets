@@ -135,7 +135,7 @@ class QuoteSession(RecordingSession):
         return QuoteResponse()
 
 
-def test_create_and_confirm_rfq_quote_use_communications_endpoints(monkeypatch) -> None:
+def test_create_delete_and_confirm_rfq_quote_use_communications_endpoints(monkeypatch) -> None:
     session = QuoteSession()
     client = KalshiClient(session=session)  # type: ignore[arg-type]
     monkeypatch.setattr(client, "_auth_headers", lambda method, path: {"auth": "test"})
@@ -146,6 +146,7 @@ def test_create_and_confirm_rfq_quote_use_communications_endpoints(monkeypatch) 
         no_bid="0.43",
         subaccount=2,
     )
+    client.delete_rfq_quote("rfq-1", quote_id)
     client.confirm_rfq_quote("rfq-1", quote_id)
 
     assert quote_id == "quote-1"
@@ -158,11 +159,13 @@ def test_create_and_confirm_rfq_quote_use_communications_endpoints(monkeypatch) 
         "post_only": True,
         "subaccount": 2,
     }
-    assert session.calls[1]["method"] == "PUT"
-    assert session.calls[1]["url"].endswith(
+    assert session.calls[1]["method"] == "DELETE"
+    assert session.calls[1]["url"].endswith("/communications/quotes/quote-1")
+    assert session.calls[2]["method"] == "PUT"
+    assert session.calls[2]["url"].endswith(
         "/communications/rfqs/rfq-1/quotes/quote-1/confirm"
     )
-    assert session.calls[1]["json"] == {}
+    assert session.calls[2]["json"] == {}
 
 
 def test_rfq_canary_preflight_reads_use_exact_authenticated_endpoints(monkeypatch) -> None:

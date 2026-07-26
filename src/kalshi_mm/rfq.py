@@ -27,6 +27,8 @@ KALSHI_RFQ_PRICE_INCREMENT = Decimal("0.0001")
 UNSUPPORTED_AUDIT_BATCH_SIZE = 1_000
 PREPARE_MARKET_BATCH_SIZE = 4
 PREPARE_MARKET_BATCH_SECONDS = 1.0
+HVM_RFQ_TERMINAL_GRACE_SECONDS = 5.0
+STANDARD_RFQ_TERMINAL_GRACE_SECONDS = 46.0
 AGGREGATED_RFQ_SKIP_REASONS = {
     "RFQ has no side within position and notional limits",
     "RFQ size exceeds the per-request contract limit",
@@ -659,6 +661,7 @@ class QuoteReservation:
     plan: RFQQuotePlan
     quote_id: str
     submitted_at_monotonic: float | None = None
+    next_ttl_cancel_attempt_monotonic: float = 0.0
     accepted_side: str | None = None
     accepted_contracts: Decimal = ZERO
     confirmed_outcome_fair: Decimal | None = None
@@ -1836,6 +1839,7 @@ class RFQMaker:
                 and reservation.submitted_at_monotonic is not None
                 and not reservation.quote_id.startswith("pending:")
                 and now - reservation.submitted_at_monotonic >= ttl
+                and now >= reservation.next_ttl_cancel_attempt_monotonic
             )
         for rfq_id, reservation in candidates:
             async with self._lock:
@@ -1845,6 +1849,7 @@ class RFQMaker:
                     or reservation.accepted_side is not None
                     or reservation.submitted_at_monotonic is None
                     or now - reservation.submitted_at_monotonic < ttl
+                    or now < reservation.next_ttl_cancel_attempt_monotonic
                 ):
                     continue
             age = now - reservation.submitted_at_monotonic
@@ -1855,6 +1860,35 @@ class RFQMaker:
                     reservation.quote_id,
                 )
             except Exception as exc:
+                terminal_not_found = False
+                if isinstance(exc, KalshiAPIError) and exc.status_code == 404:
+                    terminal_not_found = await self._ttl_quote_is_absent(
+                        rfq_id,
+                        reservation,
+                    )
+                if terminal_not_found:
+                    async with self._lock:
+                        current = self.ledger.reservations.get(rfq_id)
+                        if current is reservation:
+                            self.ledger.release(rfq_id)
+                    self._audit(
+                        "rfq_quote_ttl_reconciled_absent",
+                        {
+                            "rfq_id": rfq_id,
+                            "quote_id": reservation.quote_id,
+                            "age_seconds": round(age, 3),
+                            "reason": "delete returned 404 and authenticated reads proved "
+                            "the quote absent with no matching fill",
+                        },
+                    )
+                    continue
+                async with self._lock:
+                    current = self.ledger.reservations.get(rfq_id)
+                    if current is reservation:
+                        reservation.next_ttl_cancel_attempt_monotonic = now + max(
+                            15.0,
+                            self.config.reconcile_seconds,
+                        )
                 self._audit(
                     "rfq_quote_ttl_cancel_failed",
                     {
@@ -1879,6 +1913,62 @@ class RFQMaker:
                     "reason": "unaccepted quote exceeded its configured lifetime",
                 },
             )
+
+    async def _ttl_quote_is_absent(
+        self,
+        rfq_id: str,
+        reservation: QuoteReservation,
+    ) -> bool:
+        # A delete can race an acceptance. Wait beyond the exchange's complete
+        # confirmation + execution window before proving that a missing quote
+        # has no corresponding fill.
+        await asyncio.sleep(
+            HVM_RFQ_TERMINAL_GRACE_SECONDS
+            if reservation.plan.request.is_combo
+            else STANDARD_RFQ_TERMINAL_GRACE_SECONDS
+        )
+        try:
+            quote = await asyncio.to_thread(
+                self.client.get_rfq_quote,
+                reservation.quote_id,
+            )
+        except KalshiAPIError as exc:
+            if exc.status_code != 404:
+                return False
+        except Exception:
+            return False
+        else:
+            status = str(quote.get("status", "")).casefold()
+            terminal = bool(quote.get("cancelled_ts")) or status in {
+                "cancelled",
+                "expired",
+                "closed",
+            }
+            return terminal and not quote.get("executed_ts")
+
+        try:
+            quotes = await asyncio.to_thread(
+                self.client.get_rfq_quotes,
+                rfq_id=rfq_id,
+                user_filter="self",
+                limit=500,
+            )
+            if any(str(quote.get("id", "")) == reservation.quote_id for quote in quotes):
+                return False
+            fills = await asyncio.to_thread(
+                self.client.get_fills,
+                ticker=reservation.plan.request.ticker,
+                subaccount=self.config.subaccount,
+                limit=1000,
+            )
+        except Exception:
+            return False
+        identifiers = (
+            str(fill.get(key, ""))
+            for fill in fills
+            for key in ("creator_order_id", "order_id", "client_order_id")
+        )
+        return not any(reservation.quote_id in identifier for identifier in identifiers)
 
     async def _expire_unaccepted_quotes(self) -> None:
         ttl = self.config.max_unaccepted_quote_age_seconds
