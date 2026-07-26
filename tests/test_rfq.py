@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from kalshi_mm.client import KalshiAPIError
 from kalshi_mm.models import PriceGrid
 from kalshi_mm.rfq import (
     JsonMoneylineFairBook,
@@ -469,6 +470,12 @@ class FakeClient:
         self.confirmed.append((rfq_id, quote_id))
 
 
+class RejectedQuoteClient(FakeClient):
+    def create_rfq_quote(self, **kwargs) -> str:
+        self.created.append(kwargs)
+        raise KalshiAPIError(400, "POST", "/communications/quotes", "invalid quote")
+
+
 def created_message() -> dict:
     return {
         "type": "rfq_created",
@@ -689,12 +696,58 @@ def test_execute_combo_quotes_full_parlay_and_reprices_before_confirmation() -> 
 
     asyncio.run(scenario())
 
-    assert client.created[0]["yes_bid"] == "0.44"
-    assert client.created[0]["no_bid"] == "0.53"
+    assert client.created[0]["yes_bid"] == "0.4400"
+    assert client.created[0]["no_bid"] == "0.5300"
     assert client.confirmed == [("rfq-1", "quote-1")]
     submitted = [payload for event, payload in audit.records if event == "rfq_quote_submitted"]
     assert submitted[0]["fair_probability"] == "0.4500"
     assert submitted[0]["collection_ticker"] == "COMBO-COLLECTION"
+
+
+def test_execute_one_sided_quote_uses_fixed_precision_for_disabled_side() -> None:
+    client = FakeClient()
+    configure_combo(client)
+    maker = RFQMaker(
+        client=client,  # type: ignore[arg-type]
+        stream=EmptyStream(),
+        fair_book=MultiFairBook(combo_fairs()),
+        config=RFQMakerConfig(max_contracts=Decimal("2")),
+        audit_log=RecordingAudit(),
+        execute=True,
+        allowed_collections={"COMBO-COLLECTION"},
+    )
+
+    async def scenario() -> None:
+        await maker.prepare()
+        await maker.handle(combo_message(target_cost="1.00"))
+
+    asyncio.run(scenario())
+
+    assert client.created[0]["yes_bid"] == "0.0000"
+    assert client.created[0]["no_bid"] == "0.5300"
+
+
+def test_quote_http_rejection_releases_reservation_as_definitive_failure() -> None:
+    client = RejectedQuoteClient()
+    audit = RecordingAudit()
+    maker = RFQMaker(
+        client=client,  # type: ignore[arg-type]
+        stream=EmptyStream(),
+        fair_book=FakeFairBook(fair()),
+        config=RFQMakerConfig(),
+        audit_log=audit,
+        execute=True,
+    )
+
+    async def scenario() -> None:
+        await maker.prepare()
+        await maker.handle(created_message())
+
+    asyncio.run(scenario())
+
+    assert maker.ledger.reservations == {}
+    assert any(event == "rfq_quote_skipped" for event, _ in audit.records)
+    assert not any(event == "rfq_quote_ambiguous" for event, _ in audit.records)
 
 
 def test_execute_quotes_and_confirms_from_cached_fair() -> None:
@@ -716,8 +769,8 @@ def test_execute_quotes_and_confirms_from_cached_fair() -> None:
 
     asyncio.run(scenario())
 
-    assert client.created[0]["yes_bid"] == "0.53"
-    assert client.created[0]["no_bid"] == "0.44"
+    assert client.created[0]["yes_bid"] == "0.5300"
+    assert client.created[0]["no_bid"] == "0.4400"
     assert client.created[0]["rest_remainder"] is False
     assert client.created[0]["post_only"] is True
     assert client.confirmed == [("rfq-1", "quote-1")]

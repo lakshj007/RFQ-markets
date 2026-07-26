@@ -22,6 +22,7 @@ RFQ_LIVE_ACKNOWLEDGEMENT = "REAL_MONEY_RFQ_AUTOCONFIRM"
 HARD_MIN_RFQ_EDGE_RATE = Decimal("0.02")
 KALSHI_MAKER_FEE_RATE = Decimal("0.0175")
 KALSHI_FEE_INCREMENT = Decimal("0.0001")
+KALSHI_RFQ_PRICE_INCREMENT = Decimal("0.0001")
 UNSUPPORTED_AUDIT_BATCH_SIZE = 1_000
 PREPARE_MARKET_BATCH_SIZE = 4
 PREPARE_MARKET_BATCH_SECONDS = 1.0
@@ -29,6 +30,14 @@ AGGREGATED_RFQ_SKIP_REASONS = {
     "RFQ has no side within position and notional limits",
     "RFQ size exceeds the per-request contract limit",
 }
+
+
+def _format_rfq_price(price: Decimal) -> str:
+    price = as_decimal(price)
+    fixed = price.quantize(KALSHI_RFQ_PRICE_INCREMENT)
+    if fixed != price:
+        raise ValueError("RFQ price exceeds Kalshi's four-decimal dollar precision")
+    return format(fixed, "f")
 
 
 def estimated_maker_fee(
@@ -1462,8 +1471,8 @@ class RFQMaker:
                 quote_id = await asyncio.to_thread(
                     self.client.create_rfq_quote,
                     rfq_id=request.rfq_id,
-                    yes_bid=format(plan.yes_bid, "f"),
-                    no_bid=format(plan.no_bid, "f"),
+                    yes_bid=_format_rfq_price(plan.yes_bid),
+                    no_bid=_format_rfq_price(plan.no_bid),
                     rest_remainder=False,
                     post_only=True,
                     subaccount=self.config.subaccount,
@@ -1491,6 +1500,10 @@ class RFQMaker:
                 {**plan.as_dict(), "quote_id": quote_id, "latency_ms": round(elapsed_ms, 3)},
             )
         except Exception as exc:
+            if isinstance(exc, KalshiAPIError) and 400 <= exc.status_code < 500:
+                # A client-error response proves the exchange rejected the quote.
+                # Only transport/server failures leave submission ambiguous.
+                retain_reservation_on_error = False
             if reservation_created and not retain_reservation_on_error and request is not None:
                 async with self._lock:
                     self.ledger.release(request.rfq_id)
