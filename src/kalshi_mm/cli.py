@@ -1077,8 +1077,8 @@ def _validate_rfq_live_canary(args: argparse.Namespace) -> None:
         raise ValueError("live canary requires --combo-only and forbids --allow-live")
     if not args.contracts_only:
         raise ValueError("live canary requires --contracts-only")
-    if args.edge_percent < Decimal("2"):
-        raise ValueError("live canary requires at least 2% net modeled edge")
+    if args.edge_percent < Decimal("1.5"):
+        raise ValueError("live canary requires at least 1.5% net modeled edge")
     minimum_fee_percent = KALSHI_MAKER_FEE_RATE * Decimal("100")
     if args.maker_fee_rate_percent < minimum_fee_percent:
         raise ValueError(f"live canary maker-fee rate must be at least {minimum_fee_percent}%")

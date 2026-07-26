@@ -195,12 +195,12 @@ no_bid  <= (1 - p) × (1 - e)
 ```
 
 Both prices are rounded down to the market's current `price_ranges` grid. With the hard
-minimum `e = 2%`, each executable side is at least 2% below that outcome's fair value
-and the two raw bids sum to `$0.98` before grid rounding. At a 30% YES fair, the raw
-quotes are 29.4 cents for YES and 68.6 cents for NO, giving absolute edges of 0.6 cents
-and 1.4 cents respectively. This is proportional price edge before exchange fees and
-fee rounding; increase `--edge-percent` if the required return must be net of those
-costs.
+minimum `e = 1.5%`, each executable side is at least 1.5% below that outcome's fair value
+and the two raw bids sum to `$0.985` before grid rounding. At a 30% YES fair, the raw
+quotes are 29.55 cents for YES and 68.95 cents for NO, giving absolute edges of 0.45 cents
+and 1.05 cents respectively. Those formulas are the pre-fee starting point; the pricing
+loop lowers an executable bid further when needed to preserve the configured edge after
+modeled maker fees and fee rounding.
 
 For a combo/MVE, each selected leg contributes `p_i` for a YES leg or `1 - p_i` for a
 NO leg. Only after calculating the complete parlay fair `P = product(selected p_i)` does
@@ -245,7 +245,7 @@ kalshi-mm rfq-maker \
   --demo \
   --fair-file rfq-fairs.json \
   --allow-ticker DEMO-MARKET-TICKER \
-  --edge-percent 2 \
+  --edge-percent 1.5 \
   --max-fair-age 5 \
   --min-contracts 1 \
   --max-contracts 10 \
@@ -285,7 +285,7 @@ kalshi-mm rfq-maker \
   --allow-collection KXMVESPORTSMULTIGAMEEXTENDED-R \
   --combo-only \
   --contracts-only \
-  --edge-percent 2 \
+  --edge-percent 1.5 \
   --min-contracts 1 \
   --max-contracts 10 \
   --min-legs 2 \
@@ -313,7 +313,7 @@ kalshi-mm rfq-maker \
   --allow-collection KXMVESPORTSMULTIGAMEEXTENDED-R \
   --combo-only \
   --contracts-only \
-  --edge-percent 2 \
+  --edge-percent 1.5 \
   --min-contracts 1 \
   --max-contracts 10 \
   --min-legs 2 \
@@ -346,7 +346,7 @@ kalshi-mm rfq-maker \
   --allow-collection KXMVESPORTSMULTIGAMEEXTENDED-R \
   --combo-only \
   --contracts-only \
-  --edge-percent 2 \
+  --edge-percent 1.5 \
   --min-contracts 1 \
   --max-contracts 10 \
   --min-legs 2 \
@@ -371,7 +371,7 @@ The maker reads each quote market's series fee type and multiplier. For
 plus `0.0175 × multiplier × contracts × price × (1-price)` up to a centicent, then
 subtracting the position cost. `quadratic` series have zero maker fee. Prices move down
 the valid grid
-until the expected edge after that fee is at least the configured 2%. Unknown fee types
+until the expected edge after that fee is at least the configured threshold. Unknown fee types
 fail closed.
 
 The maker rechecks fair-value age, event start, accepted side, accepted size, and the

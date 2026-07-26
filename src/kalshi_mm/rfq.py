@@ -19,7 +19,7 @@ from .scanner import consensus_probability
 
 RFQ_LIVE_ENABLE_TOKEN = "I_UNDERSTAND_RFQ_REAL_MONEY"
 RFQ_LIVE_ACKNOWLEDGEMENT = "REAL_MONEY_RFQ_AUTOCONFIRM"
-HARD_MIN_RFQ_EDGE_RATE = Decimal("0.02")
+HARD_MIN_RFQ_EDGE_RATE = Decimal("0.015")
 KALSHI_MAKER_FEE_RATE = Decimal("0.0175")
 KALSHI_FEE_INCREMENT = Decimal("0.0001")
 KALSHI_RFQ_PRICE_INCREMENT = Decimal("0.0001")
@@ -536,7 +536,7 @@ def price_moneyline_rfq(
     maker_fee_rate = as_decimal(maker_fee_rate)
     maker_fee_multiplier = as_decimal(maker_fee_multiplier)
     if not HARD_MIN_RFQ_EDGE_RATE <= edge_rate < ONE:
-        raise ValueError("RFQ proportional edge must be in [2%, 100%)")
+        raise ValueError("RFQ proportional edge must be in [1.5%, 100%)")
     if maker_fee_rate < ZERO or maker_fee_multiplier < ZERO:
         raise ValueError("RFQ maker-fee inputs cannot be negative")
 
@@ -597,7 +597,7 @@ def price_moneyline_rfq(
 
 @dataclass(frozen=True, slots=True)
 class RFQMakerConfig:
-    edge_rate: Decimal = HARD_MIN_RFQ_EDGE_RATE
+    edge_rate: Decimal = Decimal("0.02")
     maker_fee_rate: Decimal = KALSHI_MAKER_FEE_RATE
     min_contracts: Decimal = Decimal("1")
     max_contracts: Decimal = Decimal("10")
@@ -620,7 +620,7 @@ class RFQMakerConfig:
 
     def validate(self) -> None:
         if not HARD_MIN_RFQ_EDGE_RATE <= self.edge_rate < ONE:
-            raise ValueError("RFQ proportional edge must be in [2%, 100%)")
+            raise ValueError("RFQ proportional edge must be in [1.5%, 100%)")
         if self.maker_fee_rate < KALSHI_MAKER_FEE_RATE:
             raise ValueError("RFQ maker-fee rate cannot be below Kalshi's published 1.75% rate")
         if self.min_contracts <= ZERO or self.max_contracts < self.min_contracts:
