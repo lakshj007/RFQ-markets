@@ -1075,6 +1075,8 @@ def _validate_rfq_live_canary(args: argparse.Namespace) -> None:
         )
     if not args.combo_only or args.allow_live:
         raise ValueError("live canary requires --combo-only and forbids --allow-live")
+    if not args.contracts_only:
+        raise ValueError("live canary requires --contracts-only")
     if args.edge_percent < Decimal("2"):
         raise ValueError("live canary requires at least 2% net modeled edge")
     minimum_fee_percent = KALSHI_MAKER_FEE_RATE * Decimal("100")
@@ -1233,6 +1235,7 @@ def _cmd_rfq_maker(args: argparse.Namespace) -> None:
             max_inflight_rfqs=args.max_inflight_rfqs,
             max_quote_latency_seconds=args.max_quote_latency,
             combo_only=args.combo_only,
+            contracts_only=args.contracts_only,
             require_subaccount_metadata=args.execute_live,
         ),
         audit_log=_RFQAudit(args.audit_log, json_output=args.json),
@@ -1602,6 +1605,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--combo-only",
         action="store_true",
         help="reject single-market RFQs and quote only allowed MVE collections",
+    )
+    pricing.add_argument(
+        "--contracts-only",
+        action="store_true",
+        help="reject target-cost RFQs and quote only explicit contract-count requests",
     )
     pricing.add_argument(
         "--allow-live",

@@ -284,6 +284,7 @@ kalshi-mm rfq-maker \
   --odds-sport baseball_mlb \
   --allow-collection KXMVESPORTSMULTIGAMEEXTENDED-R \
   --combo-only \
+  --contracts-only \
   --edge-percent 2 \
   --min-contracts 1 \
   --max-contracts 10 \
@@ -311,6 +312,7 @@ kalshi-mm rfq-maker \
   --odds-sport baseball_mlb \
   --allow-collection KXMVESPORTSMULTIGAMEEXTENDED-R \
   --combo-only \
+  --contracts-only \
   --edge-percent 2 \
   --min-contracts 1 \
   --max-contracts 10 \
@@ -343,6 +345,7 @@ kalshi-mm rfq-maker \
   --odds-sport baseball_mlb \
   --allow-collection KXMVESPORTSMULTIGAMEEXTENDED-R \
   --combo-only \
+  --contracts-only \
   --edge-percent 2 \
   --min-contracts 1 \
   --max-contracts 10 \

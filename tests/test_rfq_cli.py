@@ -49,6 +49,7 @@ def canary_args():
             "--allow-collection",
             "KXMVESPORTSMULTIGAMEEXTENDED-R",
             "--combo-only",
+            "--contracts-only",
             "--edge-percent",
             "2",
             "--max-contracts",
@@ -89,6 +90,14 @@ def test_rfq_live_canary_rejects_primary_account() -> None:
     args.subaccount = 0
 
     with pytest.raises(ValueError, match="dedicated numbered subaccount"):
+        _validate_rfq_live_canary(args)
+
+
+def test_rfq_live_canary_rejects_target_cost_support() -> None:
+    args = canary_args()
+    args.contracts_only = False
+
+    with pytest.raises(ValueError, match="requires --contracts-only"):
         _validate_rfq_live_canary(args)
 
 

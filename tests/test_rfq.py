@@ -723,6 +723,23 @@ def test_target_cost_risk_can_disable_only_oversized_side() -> None:
     assert constrained.no_bid == Decimal("0.53")
 
 
+def test_contracts_only_risk_profile_rejects_target_cost_rfq() -> None:
+    request = RFQRequest.from_message(combo_message(target_cost="1.00"))
+    plan = price_moneyline_rfq(
+        request,
+        replace(fair(probability="0.45"), ticker="COMBO"),
+        price_grid=PriceGrid.uniform(),
+        edge_rate=Decimal("0.02"),
+    )
+    ledger = RFQRiskLedger(
+        RFQMakerConfig(contracts_only=True),
+        available_balance=Decimal("100"),
+    )
+
+    with pytest.raises(ValueError, match="target-cost RFQs are disabled"):
+        ledger.constrain(plan)
+
+
 def test_execute_combo_quotes_full_parlay_and_reprices_before_confirmation() -> None:
     client = FakeClient()
     configure_combo(client)

@@ -30,6 +30,7 @@ AGGREGATED_RFQ_SKIP_REASONS = {
     "RFQ has no side within position and notional limits",
     "RFQ size exceeds the per-request contract limit",
     "RFQ session execution limit reached",
+    "target-cost RFQs are disabled",
 }
 
 
@@ -614,6 +615,7 @@ class RFQMakerConfig:
     max_inflight_rfqs: int = 32
     max_quote_latency_seconds: float = 1.0
     combo_only: bool = False
+    contracts_only: bool = False
     require_subaccount_metadata: bool = False
 
     def validate(self) -> None:
@@ -767,6 +769,8 @@ class RFQRiskLedger:
         )
 
     def constrain(self, plan: RFQQuotePlan) -> RFQQuotePlan:
+        if self.config.contracts_only and plan.request.contracts is None:
+            raise ValueError("target-cost RFQs are disabled")
         if (
             self.config.max_session_executions is not None
             and self.executed_quotes >= self.config.max_session_executions
@@ -964,6 +968,8 @@ class RFQMaker:
             if not self._ticker_allowed(request.ticker):
                 return "ticker is not on the moneyline allowlist"
             return None
+        if self.config.contracts_only and request.contracts is None:
+            return "target-cost RFQs are disabled"
         if self.allowed_collections and request.collection_ticker not in self.allowed_collections:
             return "MVE collection is not on the allowlist"
         if not self.config.min_legs <= len(request.legs) <= self.config.max_legs:
