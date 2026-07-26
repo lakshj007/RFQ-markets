@@ -29,6 +29,7 @@ PREPARE_MARKET_BATCH_SECONDS = 1.0
 AGGREGATED_RFQ_SKIP_REASONS = {
     "RFQ has no side within position and notional limits",
     "RFQ size exceeds the per-request contract limit",
+    "RFQ session execution limit reached",
 }
 
 
@@ -602,6 +603,7 @@ class RFQMakerConfig:
     max_abs_position: Decimal = Decimal("10")
     max_notional: Decimal = Decimal("10")
     max_session_contracts: Decimal | None = None
+    max_session_executions: int | None = None
     max_active_quotes: int = 20
     max_fair_age_seconds: float = 60
     reconcile_seconds: float = 15
@@ -627,6 +629,8 @@ class RFQMakerConfig:
             raise ValueError("RFQ notional and active-quote limits must be positive")
         if self.max_session_contracts is not None and self.max_session_contracts <= ZERO:
             raise ValueError("RFQ session contract limit must be positive when configured")
+        if self.max_session_executions is not None and self.max_session_executions <= 0:
+            raise ValueError("RFQ session execution limit must be positive when configured")
         if self.max_fair_age_seconds <= 0:
             raise ValueError("RFQ maximum fair age must be positive")
         if not 1 <= self.reconcile_seconds <= 60:
@@ -754,6 +758,7 @@ class RFQRiskLedger:
         self.available_balance = available_balance
         self.reservations: dict[str, QuoteReservation] = {}
         self.executed_contracts = ZERO
+        self.executed_quotes = 0
 
     def _reserved_balance(self) -> Decimal:
         return sum(
@@ -762,6 +767,11 @@ class RFQRiskLedger:
         )
 
     def constrain(self, plan: RFQQuotePlan) -> RFQQuotePlan:
+        if (
+            self.config.max_session_executions is not None
+            and self.executed_quotes >= self.config.max_session_executions
+        ):
+            raise ValueError("RFQ session execution limit reached")
         if plan.request.contracts is not None:
             if plan.request.contracts < self.config.min_contracts:
                 raise ValueError("RFQ size is below the minimum contract limit")
@@ -810,14 +820,14 @@ class RFQRiskLedger:
         if (
             yes_contracts < self.config.min_contracts
             or yes_contracts > self.config.max_contracts
-            or yes_bid * yes_contracts > self.config.max_notional
+            or yes_bid * yes_contracts + plan.yes_estimated_fee > self.config.max_notional
             or position + long_reserve + yes_contracts > self.config.max_abs_position
         ):
             yes_bid = ZERO
         if (
             no_contracts < self.config.min_contracts
             or no_contracts > self.config.max_contracts
-            or no_bid * no_contracts > self.config.max_notional
+            or no_bid * no_contracts + plan.no_estimated_fee > self.config.max_notional
             or position - short_reserve - no_contracts < -self.config.max_abs_position
         ):
             no_bid = ZERO
@@ -862,6 +872,7 @@ class RFQRiskLedger:
             count if side == "yes" else -count
         )
         self.executed_contracts += count
+        self.executed_quotes += 1
         price = reservation.plan.yes_bid if side == "yes" else reservation.plan.no_bid
         fee = estimated_maker_fee(
             price,
@@ -1411,6 +1422,7 @@ class RFQMaker:
                     if self.config.max_session_contracts is not None
                     else None
                 ),
+                "max_session_executions": self.config.max_session_executions,
                 "subaccount": self.config.subaccount,
                 "available_balance": str(self.ledger.available_balance),
             },

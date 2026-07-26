@@ -1090,12 +1090,14 @@ def _validate_rfq_live_canary(args: argparse.Namespace) -> None:
         raise ValueError("--allow-primary-account-canary requires --subaccount 0")
     elif not 1 <= args.subaccount <= 32:
         raise ValueError("live canary requires subaccount 0 or a numbered subaccount 1-32")
-    if not ZERO < args.min_contracts <= args.max_contracts <= Decimal("1"):
-        raise ValueError("live canary contract limits must be positive and capped at 1")
-    if args.max_position > Decimal("1") or args.max_notional > Decimal("1"):
-        raise ValueError("live canary position and notional limits must be capped at 1")
-    if args.max_session_contracts != Decimal("1"):
-        raise ValueError("live canary requires a one-contract session-wide execution cap")
+    if not ZERO < args.min_contracts <= args.max_contracts <= Decimal("10"):
+        raise ValueError("live canary contract limits must be positive and capped at 10")
+    if args.max_position > Decimal("10") or args.max_notional > Decimal("10"):
+        raise ValueError("live canary position and notional limits must be capped at 10")
+    if args.max_session_contracts != Decimal("10"):
+        raise ValueError("live canary requires a ten-contract session-wide execution cap")
+    if args.max_session_executions != 1:
+        raise ValueError("live canary requires a one-execution session-wide cap")
     if args.max_active_quotes != 1 or args.max_inflight_rfqs != 1:
         raise ValueError("live canary requires one active quote and one in-flight handler")
     if args.min_legs < 2 or args.max_legs > 6:
@@ -1134,8 +1136,8 @@ def _preflight_rfq_live_canary(client: KalshiClient, args: argparse.Namespace) -
     balance = as_decimal(client.get_balance(subaccount=args.subaccount).get("balance", "0"))
     if balance <= ZERO:
         raise ValueError("live canary account must contain at least $0.01")
-    if args.subaccount != 0 and balance > Decimal("100"):
-        raise ValueError("live canary numbered subaccount must contain no more than $1.00")
+    if args.subaccount != 0 and balance > Decimal("1000"):
+        raise ValueError("live canary numbered subaccount must contain no more than $10.00")
     if client.get_orders(status="resting", subaccount=args.subaccount, limit=1000):
         raise ValueError("live canary subaccount already has resting orders")
     if client.get_positions(subaccount=args.subaccount, limit=1000):
@@ -1220,6 +1222,7 @@ def _cmd_rfq_maker(args: argparse.Namespace) -> None:
             max_abs_position=args.max_position,
             max_notional=args.max_notional,
             max_session_contracts=args.max_session_contracts,
+            max_session_executions=args.max_session_executions,
             max_active_quotes=args.max_active_quotes,
             max_fair_age_seconds=args.max_fair_age,
             reconcile_seconds=args.reconcile_seconds,
@@ -1590,6 +1593,7 @@ def build_parser() -> argparse.ArgumentParser:
     pricing.add_argument("--max-position", type=_decimal, default=Decimal("10"))
     pricing.add_argument("--max-notional", type=_decimal, default=Decimal("10"))
     pricing.add_argument("--max-session-contracts", type=_decimal)
+    pricing.add_argument("--max-session-executions", type=int)
     pricing.add_argument("--max-active-quotes", type=int, default=20)
     pricing.add_argument("--max-fair-age", type=float, default=60)
     pricing.add_argument("--reconcile-seconds", type=float, default=15)
@@ -1616,7 +1620,7 @@ def build_parser() -> argparse.ArgumentParser:
     execution.add_argument(
         "--canary-live",
         action="store_true",
-        help="enforce the locked one-contract/$1 production MLB canary profile",
+        help="enforce the locked ten-contract/$10 production MLB canary profile",
     )
     execution.add_argument(
         "--allow-primary-account-canary",

@@ -52,12 +52,14 @@ def canary_args():
             "--edge-percent",
             "2",
             "--max-contracts",
-            "1",
+            "10",
             "--max-position",
-            "1",
+            "10",
             "--max-notional",
-            "1",
+            "10",
             "--max-session-contracts",
+            "10",
+            "--max-session-executions",
             "1",
             "--max-active-quotes",
             "1",
@@ -118,14 +120,14 @@ def test_rfq_live_canary_primary_preflight_allows_balance_above_one_dollar(tmp_p
     _preflight_rfq_live_canary(client, args)
 
 
-def test_rfq_live_canary_numbered_preflight_keeps_one_dollar_balance_cap(tmp_path) -> None:
+def test_rfq_live_canary_numbered_preflight_keeps_ten_dollar_balance_cap(tmp_path) -> None:
     key = tmp_path / "rfq.key"
     key.write_text("test", encoding="utf-8")
     key.chmod(0o600)
     args = canary_args()
-    client = CanaryClient(key, subaccount=1, balance="101")
+    client = CanaryClient(key, subaccount=1, balance="1001")
 
-    with pytest.raises(ValueError, match=r"no more than \$1.00"):
+    with pytest.raises(ValueError, match=r"no more than \$10.00"):
         _preflight_rfq_live_canary(client, args)
 
 

@@ -105,6 +105,23 @@ def test_maker_fee_is_reserved_and_price_keeps_two_percent_net_edge() -> None:
     assert plan.maximum_cost >= plan.yes_bid + plan.yes_estimated_fee
 
 
+def test_notional_cap_includes_modeled_maker_fee() -> None:
+    plan = price_moneyline_rfq(
+        request(),
+        fair(probability="0.30"),
+        price_grid=PriceGrid.uniform("0.001"),
+        edge_rate=Decimal("0.02"),
+        maker_fee_multiplier=Decimal("1"),
+    )
+    ledger = RFQRiskLedger(
+        RFQMakerConfig(max_notional=Decimal("0.293")),
+        available_balance=Decimal("100"),
+    )
+
+    with pytest.raises(ValueError, match="no side"):
+        ledger.constrain(plan)
+
+
 def test_fee_free_series_keeps_proportional_quote_at_fair_times_one_minus_edge() -> None:
     plan = price_moneyline_rfq(
         request(),
@@ -239,6 +256,39 @@ def test_session_contract_cap_allows_only_one_total_fill_across_markets() -> Non
     )
 
     with pytest.raises(ValueError, match="no side"):
+        ledger.constrain(second_plan)
+
+
+def test_session_execution_cap_stops_after_one_fill_below_contract_cap() -> None:
+    first_plan = price_moneyline_rfq(
+        request(),
+        fair(),
+        price_grid=PriceGrid.uniform(),
+        edge_rate=Decimal("0.02"),
+    )
+    ledger = RFQRiskLedger(
+        RFQMakerConfig(
+            max_session_contracts=Decimal("10"),
+            max_session_executions=1,
+        ),
+        available_balance=Decimal("100"),
+    )
+    ledger.reserve(ledger.constrain(first_plan), "quote-1")
+    reservation = ledger.release("rfq-1")
+    assert reservation is not None
+    reservation.accepted_side = "yes"
+    reservation.accepted_contracts = Decimal("1")
+    ledger.record_execution(reservation)
+
+    second_request = replace(request(), rfq_id="rfq-2", ticker="MARKET-2")
+    second_plan = price_moneyline_rfq(
+        second_request,
+        fair(ticker="MARKET-2"),
+        price_grid=PriceGrid.uniform(),
+        edge_rate=Decimal("0.02"),
+    )
+
+    with pytest.raises(ValueError, match="session execution limit"):
         ledger.constrain(second_plan)
 
 

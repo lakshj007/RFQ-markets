@@ -286,19 +286,20 @@ kalshi-mm rfq-maker \
   --combo-only \
   --edge-percent 2 \
   --min-contracts 1 \
-  --max-contracts 1 \
+  --max-contracts 10 \
   --min-legs 2 \
   --max-legs 6 \
   --max-inflight-rfqs 1 \
-  --max-position 1 \
-  --max-notional 1 \
-  --max-session-contracts 1 \
+  --max-position 10 \
+  --max-notional 10 \
+  --max-session-contracts 10 \
+  --max-session-executions 1 \
   --max-active-quotes 1 \
   --seconds 1800
 ```
 
 Production RFQs are locked to a bounded MLB canary. It requires a dedicated numbered
-subaccount funded with no more than $1, a private key file with mode `600`, a dedicated
+subaccount funded with no more than $10, a private key file with mode `600`, a dedicated
 API key whose name contains `rfq` and whose scopes are exactly `read`/`write`, the exact
 collection and fair source below, and the ephemeral enable variable and acknowledgement:
 
@@ -312,14 +313,15 @@ kalshi-mm rfq-maker \
   --combo-only \
   --edge-percent 2 \
   --min-contracts 1 \
-  --max-contracts 1 \
+  --max-contracts 10 \
   --min-legs 2 \
   --max-legs 6 \
   --max-inflight-rfqs 1 \
   --max-quote-latency 1 \
-  --max-position 1 \
-  --max-notional 1 \
-  --max-session-contracts 1 \
+  --max-position 10 \
+  --max-notional 10 \
+  --max-session-contracts 10 \
+  --max-session-executions 1 \
   --max-active-quotes 1 \
   --subaccount 1 \
   --seconds 900 \
@@ -331,8 +333,8 @@ unset KALSHI_RFQ_LIVE_ENABLED
 ```
 
 If numbered subaccounts are unavailable, the same locked canary can use the primary
-account only with the additional explicit flag below. The one-contract, $1 maximum
-notional, one-active-quote, and one-session-fill caps are unchanged, and preflight still
+account only with the additional explicit flag below. The ten-contract, $10 maximum
+notional, one-active-quote, and one-session-execution caps are unchanged, and preflight still
 requires the primary account to have no positions or resting orders:
 
 ```bash
@@ -343,14 +345,15 @@ kalshi-mm rfq-maker \
   --combo-only \
   --edge-percent 2 \
   --min-contracts 1 \
-  --max-contracts 1 \
+  --max-contracts 10 \
   --min-legs 2 \
   --max-legs 6 \
   --max-inflight-rfqs 1 \
   --max-quote-latency 1 \
-  --max-position 1 \
-  --max-notional 1 \
-  --max-session-contracts 1 \
+  --max-position 10 \
+  --max-notional 10 \
+  --max-session-contracts 10 \
+  --max-session-executions 1 \
   --max-active-quotes 1 \
   --subaccount 0 \
   --seconds 900 \
