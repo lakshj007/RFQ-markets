@@ -196,6 +196,13 @@ def test_rfq_edge_has_a_hard_one_and_a_half_percent_floor() -> None:
     RFQMakerConfig(edge_rate=Decimal("0.015")).validate()
 
 
+def test_unaccepted_quote_lifetime_must_be_finite_and_positive() -> None:
+    with pytest.raises(ValueError, match="finite and positive"):
+        RFQMakerConfig(max_unaccepted_quote_age_seconds=0).validate()
+    with pytest.raises(ValueError, match="finite and positive"):
+        RFQMakerConfig(max_unaccepted_quote_age_seconds=float("inf")).validate()
+
+
 def test_risk_ledger_disables_only_the_position_increasing_side() -> None:
     plan = price_moneyline_rfq(
         request(),
@@ -526,6 +533,12 @@ class RejectedQuoteClient(FakeClient):
     def create_rfq_quote(self, **kwargs) -> str:
         self.created.append(kwargs)
         raise KalshiAPIError(400, "POST", "/communications/quotes", "invalid quote")
+
+
+class RejectedDeleteClient(FakeClient):
+    def delete_rfq_quote(self, rfq_id: str, quote_id: str) -> None:
+        self.deleted.append((rfq_id, quote_id))
+        raise KalshiAPIError(409, "DELETE", "/communications/quotes", "quote accepted")
 
 
 def created_message() -> dict:
@@ -1085,6 +1098,92 @@ def test_run_cancels_unaccepted_quotes_on_clean_shutdown() -> None:
 
     assert client.deleted == [("rfq-1", "quote-1")]
     assert maker.ledger.reservations == {}
+
+
+def test_unaccepted_quote_ttl_cancels_only_after_the_deadline() -> None:
+    client = FakeClient()
+    audit = RecordingAudit()
+    maker = RFQMaker(
+        client=client,  # type: ignore[arg-type]
+        stream=EmptyStream(),
+        fair_book=FakeFairBook(fair()),
+        config=RFQMakerConfig(max_unaccepted_quote_age_seconds=60),
+        audit_log=audit,
+        execute=True,
+    )
+
+    async def scenario() -> None:
+        await maker.prepare()
+        await maker.handle(created_message())
+        reservation = maker.ledger.reservations["rfq-1"]
+        assert reservation.submitted_at_monotonic is not None
+        await maker._expire_unaccepted_once(
+            now=reservation.submitted_at_monotonic + 59.999
+        )
+        assert "rfq-1" in maker.ledger.reservations
+        await maker._expire_unaccepted_once(now=reservation.submitted_at_monotonic + 60)
+
+    asyncio.run(scenario())
+
+    assert client.deleted == [("rfq-1", "quote-1")]
+    assert maker.ledger.reservations == {}
+    cancelled = [payload for event, payload in audit.records if event == "rfq_quote_ttl_cancelled"]
+    assert cancelled[0]["age_seconds"] == 60
+
+
+def test_unaccepted_quote_ttl_never_cancels_an_accepted_quote() -> None:
+    client = FakeClient()
+    maker = RFQMaker(
+        client=client,  # type: ignore[arg-type]
+        stream=EmptyStream(),
+        fair_book=FakeFairBook(fair()),
+        config=RFQMakerConfig(max_unaccepted_quote_age_seconds=60),
+        audit_log=RecordingAudit(),
+        execute=True,
+    )
+
+    async def scenario() -> None:
+        await maker.prepare()
+        await maker.handle(created_message())
+        reservation = maker.ledger.reservations["rfq-1"]
+        assert reservation.submitted_at_monotonic is not None
+        reservation.accepted_side = "yes"
+        reservation.accepted_contracts = Decimal("1")
+        await maker._expire_unaccepted_once(now=reservation.submitted_at_monotonic + 60)
+
+    asyncio.run(scenario())
+
+    assert client.deleted == []
+    assert "rfq-1" in maker.ledger.reservations
+
+
+def test_unaccepted_quote_ttl_retains_risk_when_delete_fails() -> None:
+    client = RejectedDeleteClient()
+    audit = RecordingAudit()
+    maker = RFQMaker(
+        client=client,  # type: ignore[arg-type]
+        stream=EmptyStream(),
+        fair_book=FakeFairBook(fair()),
+        config=RFQMakerConfig(max_unaccepted_quote_age_seconds=60),
+        audit_log=audit,
+        execute=True,
+    )
+
+    async def scenario() -> None:
+        await maker.prepare()
+        await maker.handle(created_message())
+        reservation = maker.ledger.reservations["rfq-1"]
+        assert reservation.submitted_at_monotonic is not None
+        await maker._expire_unaccepted_once(now=reservation.submitted_at_monotonic + 60)
+
+    asyncio.run(scenario())
+
+    assert client.deleted == [("rfq-1", "quote-1")]
+    assert "rfq-1" in maker.ledger.reservations
+    failed = [
+        payload for event, payload in audit.records if event == "rfq_quote_ttl_cancel_failed"
+    ]
+    assert failed[0]["risk_reserved"] is True
 
 
 def test_run_aggregates_unsupported_rfqs_without_creating_tasks() -> None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import math
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, replace
@@ -606,6 +607,7 @@ class RFQMakerConfig:
     max_session_contracts: Decimal | None = None
     max_session_executions: int | None = None
     max_active_quotes: int = 20
+    max_unaccepted_quote_age_seconds: float | None = None
     max_fair_age_seconds: float = 60
     reconcile_seconds: float = 15
     subaccount: int = 0
@@ -629,6 +631,11 @@ class RFQMakerConfig:
             raise ValueError("RFQ contract and position limits must be positive")
         if self.max_notional <= ZERO or self.max_active_quotes <= 0:
             raise ValueError("RFQ notional and active-quote limits must be positive")
+        if self.max_unaccepted_quote_age_seconds is not None and (
+            not math.isfinite(self.max_unaccepted_quote_age_seconds)
+            or self.max_unaccepted_quote_age_seconds <= 0
+        ):
+            raise ValueError("RFQ unaccepted-quote lifetime must be finite and positive")
         if self.max_session_contracts is not None and self.max_session_contracts <= ZERO:
             raise ValueError("RFQ session contract limit must be positive when configured")
         if self.max_session_executions is not None and self.max_session_executions <= 0:
@@ -651,6 +658,7 @@ class RFQMakerConfig:
 class QuoteReservation:
     plan: RFQQuotePlan
     quote_id: str
+    submitted_at_monotonic: float | None = None
     accepted_side: str | None = None
     accepted_contracts: Decimal = ZERO
     confirmed_outcome_fair: Decimal | None = None
@@ -1429,6 +1437,9 @@ class RFQMaker:
                     else None
                 ),
                 "max_session_executions": self.config.max_session_executions,
+                "max_unaccepted_quote_age_seconds": (
+                    self.config.max_unaccepted_quote_age_seconds
+                ),
                 "subaccount": self.config.subaccount,
                 "available_balance": str(self.ledger.available_balance),
             },
@@ -1505,6 +1516,7 @@ class RFQMaker:
                     else:
                         reservation = self.ledger.reservations[request.rfq_id]
                         reservation.quote_id = quote_id
+                        reservation.submitted_at_monotonic = time.monotonic()
                 if delete_closed_quote:
                     await asyncio.to_thread(
                         self.client.delete_rfq_quote,
@@ -1811,6 +1823,77 @@ class RFQMaker:
             except Exception as exc:
                 self._audit("rfq_reconciliation_failed", {"reason": str(exc)})
 
+    async def _expire_unaccepted_once(self, *, now: float | None = None) -> None:
+        ttl = self.config.max_unaccepted_quote_age_seconds
+        if not self.execute or ttl is None:
+            return
+        now = time.monotonic() if now is None else now
+        async with self._lock:
+            candidates = tuple(
+                (rfq_id, reservation)
+                for rfq_id, reservation in self.ledger.reservations.items()
+                if reservation.accepted_side is None
+                and reservation.submitted_at_monotonic is not None
+                and not reservation.quote_id.startswith("pending:")
+                and now - reservation.submitted_at_monotonic >= ttl
+            )
+        for rfq_id, reservation in candidates:
+            async with self._lock:
+                current = self.ledger.reservations.get(rfq_id)
+                if (
+                    current is not reservation
+                    or reservation.accepted_side is not None
+                    or reservation.submitted_at_monotonic is None
+                    or now - reservation.submitted_at_monotonic < ttl
+                ):
+                    continue
+            age = now - reservation.submitted_at_monotonic
+            try:
+                await asyncio.to_thread(
+                    self.client.delete_rfq_quote,
+                    rfq_id,
+                    reservation.quote_id,
+                )
+            except Exception as exc:
+                self._audit(
+                    "rfq_quote_ttl_cancel_failed",
+                    {
+                        "rfq_id": rfq_id,
+                        "quote_id": reservation.quote_id,
+                        "age_seconds": round(age, 3),
+                        "reason": str(exc),
+                        "risk_reserved": True,
+                    },
+                )
+                continue
+            async with self._lock:
+                current = self.ledger.reservations.get(rfq_id)
+                if current is reservation:
+                    self.ledger.release(rfq_id)
+            self._audit(
+                "rfq_quote_ttl_cancelled",
+                {
+                    "rfq_id": rfq_id,
+                    "quote_id": reservation.quote_id,
+                    "age_seconds": round(age, 3),
+                    "reason": "unaccepted quote exceeded its configured lifetime",
+                },
+            )
+
+    async def _expire_unaccepted_quotes(self) -> None:
+        ttl = self.config.max_unaccepted_quote_age_seconds
+        if ttl is None:
+            return
+        interval = min(1.0, ttl)
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await self._expire_unaccepted_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._audit("rfq_quote_ttl_loop_failed", {"reason": str(exc)})
+
     async def shutdown(self) -> None:
         if not self.execute:
             return
@@ -1931,6 +2014,11 @@ class RFQMaker:
         await self.prepare()
         refresh_task = asyncio.create_task(self._refresh_fairs())
         reconcile_task = asyncio.create_task(self._reconcile_quotes()) if self.execute else None
+        expiry_task = (
+            asyncio.create_task(self._expire_unaccepted_quotes())
+            if self.execute and self.config.max_unaccepted_quote_age_seconds is not None
+            else None
+        )
         try:
             if seconds > 0:
                 with contextlib.suppress(TimeoutError):
@@ -1943,8 +2031,14 @@ class RFQMaker:
             refresh_task.cancel()
             if reconcile_task is not None:
                 reconcile_task.cancel()
+            if expiry_task is not None:
+                expiry_task.cancel()
             await asyncio.gather(
-                *(task for task in (refresh_task, reconcile_task) if task is not None),
+                *(
+                    task
+                    for task in (refresh_task, reconcile_task, expiry_task)
+                    if task is not None
+                ),
                 return_exceptions=True,
             )
             if self._tasks:

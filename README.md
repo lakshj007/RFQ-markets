@@ -325,6 +325,7 @@ kalshi-mm rfq-maker \
   --max-session-contracts 10 \
   --max-session-executions 1 \
   --max-active-quotes 1 \
+  --max-unaccepted-quote-age 60 \
   --subaccount 1 \
   --seconds 900 \
   --canary-live \
@@ -358,6 +359,7 @@ kalshi-mm rfq-maker \
   --max-session-contracts 10 \
   --max-session-executions 1 \
   --max-active-quotes 1 \
+  --max-unaccepted-quote-age 60 \
   --subaccount 0 \
   --seconds 900 \
   --canary-live \
@@ -379,6 +381,9 @@ full net configured edge immediately before confirmation. It reserves balance, m
 fees, and both directional position outcomes across outstanding quotes, retains accepted
 exposure
 through Kalshi's execution timer, uses `post_only=true`, and never rests a remainder.
+The locked production canary deletes a successfully submitted quote if it remains
+unaccepted for 60 seconds, freeing its one active-quote slot without releasing accepted
+or ambiguous exposure.
 It reconciles quote state and portfolio risk every 15 seconds, refuses to start over
 unresolved quotes from an earlier process, and cancels its unaccepted quotes on clean
 shutdown. Every decision and measured quote/confirmation latency is appended to

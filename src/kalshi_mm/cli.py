@@ -1039,6 +1039,9 @@ class _RFQAudit:
         if event in {
             "rfq_quote_dry_run",
             "rfq_quote_submitted",
+            "rfq_quote_ttl_cancelled",
+            "rfq_quote_ttl_cancel_failed",
+            "rfq_quote_ttl_loop_failed",
             "rfq_quote_confirmed",
             "rfq_quote_executed",
             "rfq_quote_ambiguous",
@@ -1102,6 +1105,8 @@ def _validate_rfq_live_canary(args: argparse.Namespace) -> None:
         raise ValueError("live canary requires a one-execution session-wide cap")
     if args.max_active_quotes != 1 or args.max_inflight_rfqs != 1:
         raise ValueError("live canary requires one active quote and one in-flight handler")
+    if args.max_unaccepted_quote_age != 60:
+        raise ValueError("live canary requires a 60-second unaccepted-quote lifetime")
     if args.min_legs < 2 or args.max_legs > 6:
         raise ValueError("live canary allows only 2-6 independent moneyline legs")
     if (
@@ -1226,6 +1231,7 @@ def _cmd_rfq_maker(args: argparse.Namespace) -> None:
             max_session_contracts=args.max_session_contracts,
             max_session_executions=args.max_session_executions,
             max_active_quotes=args.max_active_quotes,
+            max_unaccepted_quote_age_seconds=args.max_unaccepted_quote_age,
             max_fair_age_seconds=args.max_fair_age,
             reconcile_seconds=args.reconcile_seconds,
             subaccount=args.subaccount,
@@ -1598,6 +1604,11 @@ def build_parser() -> argparse.ArgumentParser:
     pricing.add_argument("--max-session-contracts", type=_decimal)
     pricing.add_argument("--max-session-executions", type=int)
     pricing.add_argument("--max-active-quotes", type=int, default=20)
+    pricing.add_argument(
+        "--max-unaccepted-quote-age",
+        type=float,
+        help="delete successfully submitted quotes that remain unaccepted for this many seconds",
+    )
     pricing.add_argument("--max-fair-age", type=float, default=60)
     pricing.add_argument("--reconcile-seconds", type=float, default=15)
     pricing.add_argument("--subaccount", type=int, default=0)

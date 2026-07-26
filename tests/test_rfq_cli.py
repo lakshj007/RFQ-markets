@@ -64,6 +64,8 @@ def canary_args():
             "1",
             "--max-active-quotes",
             "1",
+            "--max-unaccepted-quote-age",
+            "60",
             "--max-inflight-rfqs",
             "1",
             "--max-legs",
@@ -90,6 +92,14 @@ def test_rfq_live_canary_rejects_edge_below_one_and_a_half_percent() -> None:
     args.edge_percent = Decimal("1.499")
 
     with pytest.raises(ValueError, match="at least 1.5%"):
+        _validate_rfq_live_canary(args)
+
+
+def test_rfq_live_canary_requires_sixty_second_unaccepted_quote_lifetime() -> None:
+    args = canary_args()
+    args.max_unaccepted_quote_age = None
+
+    with pytest.raises(ValueError, match="60-second"):
         _validate_rfq_live_canary(args)
 
 
