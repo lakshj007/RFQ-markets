@@ -2,7 +2,40 @@ from decimal import Decimal
 
 import pytest
 
-from kalshi_mm.cli import _validate_rfq_live_canary, build_parser
+from kalshi_mm.cli import _preflight_rfq_live_canary, _validate_rfq_live_canary, build_parser
+
+
+class CanaryClient:
+    api_key_id = "rfq-key-id"
+
+    def __init__(self, private_key_path, *, subaccount: int, balance: str) -> None:
+        self.private_key_path = private_key_path
+        self.subaccount = subaccount
+        self.balance = balance
+
+    def get_api_keys(self):
+        return [
+            {
+                "api_key_id": self.api_key_id,
+                "name": "rfq-key",
+                "scopes": ["read", "write"],
+            }
+        ]
+
+    def get_subaccount_balances(self):
+        return [{"subaccount_number": self.subaccount}]
+
+    def get_balance(self, *, subaccount: int):
+        assert subaccount == self.subaccount
+        return {"balance": self.balance}
+
+    def get_orders(self, *, status: str, subaccount: int, limit: int):
+        assert (status, subaccount, limit) == ("resting", self.subaccount, 1000)
+        return []
+
+    def get_positions(self, *, subaccount: int, limit: int):
+        assert (subaccount, limit) == (self.subaccount, 1000)
+        return []
 
 
 def canary_args():
@@ -55,6 +88,45 @@ def test_rfq_live_canary_rejects_primary_account() -> None:
 
     with pytest.raises(ValueError, match="dedicated numbered subaccount"):
         _validate_rfq_live_canary(args)
+
+
+def test_rfq_live_canary_accepts_primary_account_with_explicit_flag() -> None:
+    args = canary_args()
+    args.subaccount = 0
+    args.allow_primary_account_canary = True
+
+    _validate_rfq_live_canary(args)
+
+
+def test_rfq_live_canary_rejects_primary_flag_for_numbered_subaccount() -> None:
+    args = canary_args()
+    args.allow_primary_account_canary = True
+
+    with pytest.raises(ValueError, match="requires --subaccount 0"):
+        _validate_rfq_live_canary(args)
+
+
+def test_rfq_live_canary_primary_preflight_allows_balance_above_one_dollar(tmp_path) -> None:
+    key = tmp_path / "rfq.key"
+    key.write_text("test", encoding="utf-8")
+    key.chmod(0o600)
+    args = canary_args()
+    args.subaccount = 0
+    args.allow_primary_account_canary = True
+    client = CanaryClient(key, subaccount=0, balance="1000")
+
+    _preflight_rfq_live_canary(client, args)
+
+
+def test_rfq_live_canary_numbered_preflight_keeps_one_dollar_balance_cap(tmp_path) -> None:
+    key = tmp_path / "rfq.key"
+    key.write_text("test", encoding="utf-8")
+    key.chmod(0o600)
+    args = canary_args()
+    client = CanaryClient(key, subaccount=1, balance="101")
+
+    with pytest.raises(ValueError, match=r"no more than \$1.00"):
+        _preflight_rfq_live_canary(client, args)
 
 
 def test_rfq_live_canary_rejects_any_extra_collection() -> None:

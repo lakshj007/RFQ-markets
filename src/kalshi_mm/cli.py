@@ -1080,8 +1080,16 @@ def _validate_rfq_live_canary(args: argparse.Namespace) -> None:
     minimum_fee_percent = KALSHI_MAKER_FEE_RATE * Decimal("100")
     if args.maker_fee_rate_percent < minimum_fee_percent:
         raise ValueError(f"live canary maker-fee rate must be at least {minimum_fee_percent}%")
-    if not 1 <= args.subaccount <= 32:
-        raise ValueError("live canary requires a dedicated numbered subaccount")
+    if args.subaccount == 0:
+        if not args.allow_primary_account_canary:
+            raise ValueError(
+                "live canary requires a dedicated numbered subaccount unless "
+                "--allow-primary-account-canary is set"
+            )
+    elif args.allow_primary_account_canary:
+        raise ValueError("--allow-primary-account-canary requires --subaccount 0")
+    elif not 1 <= args.subaccount <= 32:
+        raise ValueError("live canary requires subaccount 0 or a numbered subaccount 1-32")
     if not ZERO < args.min_contracts <= args.max_contracts <= Decimal("1"):
         raise ValueError("live canary contract limits must be positive and capped at 1")
     if args.max_position > Decimal("1") or args.max_notional > Decimal("1"):
@@ -1122,10 +1130,12 @@ def _preflight_rfq_live_canary(client: KalshiClient, args: argparse.Namespace) -
 
     subaccounts = client.get_subaccount_balances()
     if not any(int(item.get("subaccount_number", -1)) == args.subaccount for item in subaccounts):
-        raise ValueError(f"dedicated subaccount {args.subaccount} does not exist")
+        raise ValueError(f"canary subaccount {args.subaccount} does not exist")
     balance = as_decimal(client.get_balance(subaccount=args.subaccount).get("balance", "0"))
-    if balance <= ZERO or balance > Decimal("100"):
-        raise ValueError("live canary subaccount must contain between $0.01 and $1.00")
+    if balance <= ZERO:
+        raise ValueError("live canary account must contain at least $0.01")
+    if args.subaccount != 0 and balance > Decimal("100"):
+        raise ValueError("live canary numbered subaccount must contain no more than $1.00")
     if client.get_orders(status="resting", subaccount=args.subaccount, limit=1000):
         raise ValueError("live canary subaccount already has resting orders")
     if client.get_positions(subaccount=args.subaccount, limit=1000):
@@ -1607,6 +1617,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--canary-live",
         action="store_true",
         help="enforce the locked one-contract/$1 production MLB canary profile",
+    )
+    execution.add_argument(
+        "--allow-primary-account-canary",
+        action="store_true",
+        help="explicitly allow the locked production canary to use subaccount 0",
     )
     execution.add_argument("--acknowledge-risk")
     rfq.add_argument("--audit-log", type=Path, default=Path("logs/rfq-maker.jsonl"))

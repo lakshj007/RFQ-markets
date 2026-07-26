@@ -330,6 +330,36 @@ kalshi-mm rfq-maker \
 unset KALSHI_RFQ_LIVE_ENABLED
 ```
 
+If numbered subaccounts are unavailable, the same locked canary can use the primary
+account only with the additional explicit flag below. The one-contract, $1 maximum
+notional, one-active-quote, and one-session-fill caps are unchanged, and preflight still
+requires the primary account to have no positions or resting orders:
+
+```bash
+kalshi-mm rfq-maker \
+  --series KXMLBGAME \
+  --odds-sport baseball_mlb \
+  --allow-collection KXMVESPORTSMULTIGAMEEXTENDED-R \
+  --combo-only \
+  --edge-percent 2 \
+  --min-contracts 1 \
+  --max-contracts 1 \
+  --min-legs 2 \
+  --max-legs 6 \
+  --max-inflight-rfqs 1 \
+  --max-quote-latency 1 \
+  --max-position 1 \
+  --max-notional 1 \
+  --max-session-contracts 1 \
+  --max-active-quotes 1 \
+  --subaccount 0 \
+  --seconds 900 \
+  --canary-live \
+  --allow-primary-account-canary \
+  --execute-live \
+  --acknowledge-risk REAL_MONEY_RFQ_AUTOCONFIRM
+```
+
 The maker reads each quote market's series fee type and multiplier. For
 `quadratic_with_maker_fees`, it models Kalshi's maker fee by rounding the position cost
 plus `0.0175 × multiplier × contracts × price × (1-price)` up to a centicent, then
