@@ -181,19 +181,19 @@ def test_parallel_market_setup_singleflights_series_fee_metadata() -> None:
     assert client.series_detail_requests == 1
 
 
-def test_rfq_edge_has_a_hard_one_and_a_half_percent_floor() -> None:
-    with pytest.raises(ValueError, match=r"\[1\.5%, 100%\)"):
+def test_rfq_edge_has_a_hard_one_percent_floor() -> None:
+    with pytest.raises(ValueError, match=r"\[1%, 100%\)"):
         price_moneyline_rfq(
             request(),
             fair(),
             price_grid=PriceGrid.uniform(),
-            edge_rate=Decimal("0.01499"),
+            edge_rate=Decimal("0.00999"),
         )
 
-    with pytest.raises(ValueError, match=r"\[1\.5%, 100%\)"):
-        RFQMakerConfig(edge_rate=Decimal("0.01")).validate()
+    with pytest.raises(ValueError, match=r"\[1%, 100%\)"):
+        RFQMakerConfig(edge_rate=Decimal("0.005")).validate()
 
-    RFQMakerConfig(edge_rate=Decimal("0.015")).validate()
+    RFQMakerConfig(edge_rate=Decimal("0.01")).validate()
 
 
 def test_unaccepted_quote_lifetime_must_be_finite_and_positive() -> None:

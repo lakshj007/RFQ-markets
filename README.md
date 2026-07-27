@@ -195,10 +195,10 @@ no_bid  <= (1 - p) × (1 - e)
 ```
 
 Both prices are rounded down to the market's current `price_ranges` grid. With the hard
-minimum `e = 1.5%`, each executable side is at least 1.5% below that outcome's fair value
-and the two raw bids sum to `$0.985` before grid rounding. At a 30% YES fair, the raw
-quotes are 29.55 cents for YES and 68.95 cents for NO, giving absolute edges of 0.45 cents
-and 1.05 cents respectively. Those formulas are the pre-fee starting point; the pricing
+minimum `e = 1%`, each executable side is at least 1% below that outcome's fair value
+and the two raw bids sum to `$0.99` before grid rounding. At a 30% YES fair, the raw
+quotes are 29.7 cents for YES and 69.3 cents for NO, giving absolute edges of 0.3 cents
+and 0.7 cents respectively. Those formulas are the pre-fee starting point; the pricing
 loop lowers an executable bid further when needed to preserve the configured edge after
 modeled maker fees and fee rounding.
 
@@ -245,7 +245,7 @@ kalshi-mm rfq-maker \
   --demo \
   --fair-file rfq-fairs.json \
   --allow-ticker DEMO-MARKET-TICKER \
-  --edge-percent 1.5 \
+  --edge-percent 1 \
   --max-fair-age 5 \
   --min-contracts 1 \
   --max-contracts 10 \
@@ -285,7 +285,7 @@ kalshi-mm rfq-maker \
   --allow-collection KXMVESPORTSMULTIGAMEEXTENDED-R \
   --combo-only \
   --contracts-only \
-  --edge-percent 1.5 \
+  --edge-percent 1 \
   --min-contracts 1 \
   --max-contracts 10 \
   --min-legs 2 \
@@ -313,7 +313,7 @@ kalshi-mm rfq-maker \
   --allow-collection KXMVESPORTSMULTIGAMEEXTENDED-R \
   --combo-only \
   --contracts-only \
-  --edge-percent 1.5 \
+  --edge-percent 1 \
   --min-contracts 1 \
   --max-contracts 10 \
   --min-legs 2 \
@@ -347,7 +347,7 @@ kalshi-mm rfq-maker \
   --allow-collection KXMVESPORTSMULTIGAMEEXTENDED-R \
   --combo-only \
   --contracts-only \
-  --edge-percent 1.5 \
+  --edge-percent 1 \
   --min-contracts 1 \
   --max-contracts 10 \
   --min-legs 2 \

@@ -51,7 +51,7 @@ def canary_args():
             "--combo-only",
             "--contracts-only",
             "--edge-percent",
-            "1.5",
+            "1",
             "--max-contracts",
             "10",
             "--max-position",
@@ -84,14 +84,14 @@ def test_locked_rfq_live_canary_profile_is_accepted() -> None:
 
     _validate_rfq_live_canary(args)
 
-    assert args.edge_percent == Decimal("1.5")
+    assert args.edge_percent == Decimal("1")
 
 
-def test_rfq_live_canary_rejects_edge_below_one_and_a_half_percent() -> None:
+def test_rfq_live_canary_rejects_edge_below_one_percent() -> None:
     args = canary_args()
-    args.edge_percent = Decimal("1.499")
+    args.edge_percent = Decimal("0.999")
 
-    with pytest.raises(ValueError, match="at least 1.5%"):
+    with pytest.raises(ValueError, match="at least 1%"):
         _validate_rfq_live_canary(args)
 
 
