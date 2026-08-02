@@ -342,6 +342,13 @@ class KalshiClient:
             authenticated=True,
         ).get("quotes", [])
 
+    def get_rfq(self, rfq_id: str) -> dict[str, Any]:
+        return self._request(
+            "GET",
+            f"/communications/rfqs/{rfq_id}",
+            authenticated=True,
+        )["rfq"]
+
     def get_rfq_quote(self, quote_id: str) -> dict[str, Any]:
         return self._request(
             "GET",

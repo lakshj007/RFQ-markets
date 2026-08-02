@@ -195,12 +195,12 @@ no_bid  <= (1 - p) × (1 - e)
 ```
 
 Both prices are rounded down to the market's current `price_ranges` grid. With the hard
-minimum `e = 1%`, each executable side is at least 1% below that outcome's fair value
-and the two raw bids sum to `$0.99` before grid rounding. At a 30% YES fair, the raw
-quotes are 29.7 cents for YES and 69.3 cents for NO, giving absolute edges of 0.3 cents
-and 0.7 cents respectively. Those formulas are the pre-fee starting point; the pricing
-loop lowers an executable bid further when needed to preserve the configured edge after
-modeled maker fees and fee rounding.
+minimum `e = 0.75%`, each executable side is at least 0.75% below that outcome's fair
+value and the two raw bids sum to `$0.9925` before grid rounding. At a 30% YES fair, the
+raw quotes are 29.775 cents for YES and 69.475 cents for NO, giving absolute edges of
+0.225 cents and 0.525 cents respectively. Those formulas are the pre-fee starting point;
+the pricing loop lowers an executable bid further when needed to preserve the configured
+edge after modeled maker fees and fee rounding.
 
 For a combo/MVE, each selected leg contributes `p_i` for a YES leg or `1 - p_i` for a
 NO leg. Only after calculating the complete parlay fair `P = product(selected p_i)` does
@@ -215,6 +215,9 @@ The edge is therefore on the customer's finished parlay, not separately compound
 each leg. Both bids remain prices per contract. The quote implicitly covers the RFQ's
 full `contracts_fp` size or the side-specific contract count Kalshi derives from
 `target_cost_dollars`.
+
+The default proportional edge is `1.1%`. For example, a 60-cent fair outcome has a
+raw 0.66-cent edge before grid rounding and any fee-aware adjustment.
 
 The fast external-feed interface is an atomically replaced JSON file. Each entry must
 explicitly identify a fresh, pregame moneyline:
@@ -245,7 +248,7 @@ kalshi-mm rfq-maker \
   --demo \
   --fair-file rfq-fairs.json \
   --allow-ticker DEMO-MARKET-TICKER \
-  --edge-percent 1 \
+  --edge-percent 0.75 \
   --max-fair-age 5 \
   --min-contracts 1 \
   --max-contracts 10 \
@@ -274,9 +277,87 @@ kalshi-mm rfq-maker \
   --max-fair-age 60
 ```
 
-Before production, run the exact canary profile as a read-only shadow. This sees live
-RFQs and produces quote decisions, but does not call any quote or confirmation write
-endpoint:
+### Lead-style RFQ profile
+
+`--lead-style-profile` enables the conservative subset of the supplied desk policy:
+Pinnacle-only de-vigged prices, NO bids only, moneyline YES legs only, a -250
+moneyline-favorite ceiling, a 12-hour pregame horizon, minimum two legs, and the
+existing fail-closed same-game/shared-participant checks. Pricing uses a 0.6-cent
+base margin and 0.7-cent minimum boundary cushion. A two-leg parlay adds 0.9 cents;
+soccer and player-prop legs each add 0.5 cent. Premiums apply to both the requested
+margin and cushion floor, the margin is capped at half the distance from fair value to
+the nearest 0/1 boundary, fees are included, and bids snap down to Kalshi's 0.1-cent
+grid.
+
+Add `--proportional-pricing --edge-percent 1.1` alongside `--lead-style-profile` to
+keep all of those lead-style filters while replacing the fixed-cent margin and premiums
+with a single 1.1% edge on the complete parlay outcome fair value.
+
+Repeat `--odds-lane SERIES:SPORT:MARKET` to price cross-sport parlays from explicit
+lanes. The currently mapped lanes are:
+
+- `KXMLBGAME:baseball_mlb:h2h`, `KXMLBTOTAL:baseball_mlb:totals`, and
+  `KXMLBSPREAD:baseball_mlb:spreads`
+- `KXWNBAGAME:basketball_wnba:h2h`, `KXWNBATOTAL:basketball_wnba:totals`, and
+  `KXWNBASPREAD:basketball_wnba:spreads`
+- `KXMLSGAME:soccer_usa_mls:h2h` and `KXMLSTOTAL:soccer_usa_mls:totals`
+- `KXLIGAMXGAME:soccer_mexico_ligamx:h2h` and
+  `KXLIGAMXTOTAL:soccer_mexico_ligamx:totals`
+
+Example read-only shadow configuration:
+
+```bash
+kalshi-mm rfq-maker \
+  --lead-style-profile \
+  --odds-lane KXMLBGAME:baseball_mlb:h2h \
+  --odds-lane KXMLBTOTAL:baseball_mlb:totals \
+  --odds-lane KXWNBAGAME:basketball_wnba:h2h \
+  --odds-lane KXMLSGAME:soccer_usa_mls:h2h \
+  --allow-collection KXMVESPORTSMULTIGAMEEXTENDED-R \
+  --combo-only \
+  --allow-target-cost \
+  --coverage-shadow \
+  --max-target-cost 8.65 \
+  --max-contracts 10 \
+  --max-notional 8.65 \
+  --max-session-notional 8.65 \
+  --per-leg-outcome-cap 2 \
+  --per-combo-cap 2 \
+  --max-unaccepted-quote-age 60 \
+  --seconds 1800
+```
+
+The dollar caps above are examples, not bankroll recommendations. Set them from the
+amount deliberately allocated to this strategy. Per-leg-outcome exposure is charged
+conservatively at the full quote cost for every selected outcome and is rechecked at
+the accepted contract count.
+
+The lead-style profile resolves the public RFQ creator ID through authenticated REST
+because Kalshi currently leaves `creator_id` empty on `rfq_created` WebSocket events.
+The first two otherwise eligible RFQs from one creator inside ten seconds are allowed;
+the third blocks that creator for the rest of the process. Missing creator identity
+fails closed. Cumulative `rfq_unique_combo_summary` audit records separately report
+unique RFQ IDs, unique combo tickers, repeat requests, and the ten most-reposted combos.
+
+Use `--require-active-sport wnba`, `--require-active-sport mls`, or
+`--require-active-sport liga_mx` to prevent a canary from starting unless that sport
+has a fresh, priceable fixture inside the configured pregame horizon. The startup
+`rfq_lane_readiness` audit record reports eligible fair counts by sport even when no
+sport is required.
+
+MLB player props are not enabled yet because their event-level Odds API payloads need
+separate exact-threshold mappings. UFC is likewise not on the profile's lane allowlist until a
+trusted card-start field can enforce the 45-minute card lock. Creator/day limits,
+periodic reconstruction of all exchange exposure, independent post-fill re-audits,
+and Telegram controls/watchdogs are not yet implemented. These gaps fail closed or
+remain outside the production-live allowlist; this profile must be shadow-tested before
+any expansion of the locked MLB live canary.
+
+Before production, run target-cost coverage as a read-only shadow. This sees live RFQs,
+applies every collection, moneyline, independence, freshness, sizing, and aggregate-risk
+check, but does not call any quote or confirmation write endpoint. Batched
+`rfq_coverage_summary` audit records break quoteable and rejected traffic down by
+`contracts` versus `target_cost` sizing:
 
 ```bash
 kalshi-mm rfq-maker \
@@ -284,22 +365,29 @@ kalshi-mm rfq-maker \
   --odds-sport baseball_mlb \
   --allow-collection KXMVESPORTSMULTIGAMEEXTENDED-R \
   --combo-only \
-  --contracts-only \
-  --edge-percent 1 \
+  --allow-target-cost \
+  --coverage-shadow \
+  --max-target-cost 10 \
+  --edge-percent 0.75 \
   --min-contracts 1 \
   --max-contracts 10 \
   --min-legs 2 \
-  --max-legs 6 \
-  --max-inflight-rfqs 1 \
+  --max-legs 10 \
+  --max-inflight-rfqs 20 \
   --max-position 10 \
   --max-notional 10 \
+  --max-session-notional 10 \
   --max-session-contracts 10 \
   --max-session-executions 1 \
-  --max-active-quotes 1 \
+  --max-active-quotes 20 \
+  --first-fill-wins \
+  --max-unaccepted-quote-age 60 \
   --seconds 1800
 ```
 
-Production RFQs are locked to a bounded MLB canary. It requires a dedicated numbered
+Production RFQs are locked to a bounded allowlisted canary. The legacy single-lane
+form below remains MLB-moneyline-only; `--lead-style-profile` may instead use repeated
+allowlisted `--odds-lane` values for MLB, WNBA, MLS, and Liga MX. It requires a dedicated numbered
 subaccount funded with no more than $10, a private key file with mode `600`, a dedicated
 API key whose name contains `rfq` and whose scopes are exactly `read`/`write`, the exact
 collection and fair source below, and the ephemeral enable variable and acknowledgement:
@@ -312,19 +400,22 @@ kalshi-mm rfq-maker \
   --odds-sport baseball_mlb \
   --allow-collection KXMVESPORTSMULTIGAMEEXTENDED-R \
   --combo-only \
-  --contracts-only \
-  --edge-percent 1 \
+  --allow-target-cost \
+  --max-target-cost 10 \
+  --edge-percent 0.75 \
   --min-contracts 1 \
   --max-contracts 10 \
   --min-legs 2 \
-  --max-legs 6 \
-  --max-inflight-rfqs 1 \
+  --max-legs 10 \
+  --max-inflight-rfqs 20 \
   --max-quote-latency 1 \
   --max-position 10 \
   --max-notional 10 \
+  --max-session-notional 10 \
   --max-session-contracts 10 \
   --max-session-executions 1 \
-  --max-active-quotes 1 \
+  --max-active-quotes 20 \
+  --first-fill-wins \
   --max-unaccepted-quote-age 60 \
   --subaccount 1 \
   --seconds 900 \
@@ -335,10 +426,34 @@ kalshi-mm rfq-maker \
 unset KALSHI_RFQ_LIVE_ENABLED
 ```
 
+Use `--contracts-only` instead of `--allow-target-cost --max-target-cost 10` to retain
+the narrower fixed-contract profile. Target-cost sizing never changes the requester's
+budget or chooses a partial size. Before acceptance, the maker reserves
+`target_cost / (1 - maker_bid)`, rounded up to 0.01 contract. This ignores the
+requester's nonnegative fee and therefore bounds Kalshi's exchange-derived count from
+above. At acceptance, the maker uses Kalshi's exact `contracts_accepted_fp`, disables
+an unsafe side, and rejects a request above the explicit $10 target-cost cap.
+
 If numbered subaccounts are unavailable, the same locked canary can use the primary
-account only with the additional explicit flag below. The ten-contract, $10 maximum
-notional, one-active-quote, and one-session-execution caps are unchanged, and preflight still
-requires the primary account to have no positions or resting orders:
+account only with the additional explicit flag below. The aggregate ten-contract, $10
+maximum notional, and one-session-execution caps are unchanged. With
+`--first-fill-wins`, up to 20 displayed quotes share one conditional risk envelope. The
+first valid acceptance atomically owns the only confirmation slot and triggers immediate
+cancellation of every competing quote; later acceptances cannot be confirmed. Every
+individual parlay must still have disjoint events and participants, so any realized fill
+retains the independence requirement. Without this mode, active reservations remain
+additive and mutually disjoint. Preflight still requires the primary account to have no
+positions or resting orders. Kalshi represents the primary account as a missing/null
+subaccount in quote messages; numbered canaries still require an exact subaccount match:
+
+An account with an open combo position remains blocked by default. A deliberately
+continued canary may add `--continue-open-independent-positions`; startup then reloads
+every open combo's canonical selected-leg metadata, requires fresh supported moneyline
+identity data, verifies that the existing positions are mutually disjoint, and rejects
+every new RFQ sharing an event or normalized participant. Missing or unsupported
+position metadata fails closed. For a partially deployed account, set
+`--max-notional`, `--max-session-notional`, and `--max-target-cost` at or below the
+remaining authorized cash rather than reusing the $10 defaults.
 
 ```bash
 kalshi-mm rfq-maker \
@@ -347,18 +462,20 @@ kalshi-mm rfq-maker \
   --allow-collection KXMVESPORTSMULTIGAMEEXTENDED-R \
   --combo-only \
   --contracts-only \
-  --edge-percent 1 \
+  --edge-percent 0.75 \
   --min-contracts 1 \
   --max-contracts 10 \
   --min-legs 2 \
   --max-legs 6 \
-  --max-inflight-rfqs 1 \
+  --max-inflight-rfqs 20 \
   --max-quote-latency 1 \
   --max-position 10 \
   --max-notional 10 \
+  --max-session-notional 10 \
   --max-session-contracts 10 \
   --max-session-executions 1 \
-  --max-active-quotes 1 \
+  --max-active-quotes 20 \
+  --first-fill-wins \
   --max-unaccepted-quote-age 60 \
   --subaccount 0 \
   --seconds 900 \
@@ -381,9 +498,13 @@ full net configured edge immediately before confirmation. It reserves balance, m
 fees, and both directional position outcomes across outstanding quotes, retains accepted
 exposure
 through Kalshi's execution timer, uses `post_only=true`, and never rests a remainder.
+When `--first-fill-wins` is enabled with the required one-execution cap, outstanding
+quotes are conditional alternatives and share the maximum single-quote balance,
+contract, and notional envelope instead of summing mutually exclusive outcomes.
 The locked production canary deletes a successfully submitted quote if it remains
-unaccepted for 60 seconds, freeing its one active-quote slot without releasing accepted
-or ambiguous exposure.
+unaccepted for 60 seconds, freeing its active-quote slot without releasing accepted or
+ambiguous exposure. An atomic confirmation gate ensures a one-execution session cannot
+confirm a second concurrently accepted quote.
 It reconciles quote state and portfolio risk every 15 seconds, refuses to start over
 unresolved quotes from an earlier process, and cancels its unaccepted quotes on clean
 shutdown. Every decision and measured quote/confirmation latency is appended to
@@ -406,23 +527,29 @@ does not silently omit the fill.
    fair for every selected leg, and exact selected-leg agreement with Kalshi's combo
    market metadata.
 3. Reject repeated markets, repeated Kalshi `event_ticker` values, shared normalized
-   participant identities, in-play legs, sibling-event positions, and overlap with any
-   active quote reservation. Missing correlation metadata is a rejection, not an
-   assumption of independence.
+   participant identities, in-play legs, and sibling-event positions. Without
+   `--first-fill-wins`, also reject event or participant overlap with any active quote
+   reservation. Missing correlation metadata is a rejection, not an assumption of
+   independence.
 4. Convert every leg to its selected-side probability and multiply them once. Start each
    combo outcome bid at `outcome_fair × (1 - edge_rate)`, round down to the valid grid,
    then step down as needed until modeled maker fees still leave the full proportional
    edge net of fees.
-5. Resolve fixed-size requests directly. For target-cost requests, conservatively round
-   each side's derived size up to the next 0.01 contract for local risk checks. Disable
-   a side if its size, position, notional, or balance limit would be exceeded.
+5. Resolve fixed-size requests directly. For target-cost requests, reject a requester
+   budget above the configured cap and reserve `target_cost / (1 - maker_bid)`, rounded
+   up to 0.01 contract, as a fee-independent upper bound. At acceptance, use Kalshi's
+   exact contract count. Disable a side if its size, position, notional, aggregate
+   reservation, or balance limit would be exceeded.
 6. Reserve worst-case balance and directional inventory locally, then submit the quote
    through `POST /communications/quotes`. At most 32 RFQs are processed concurrently
    by default; excess burst traffic and any request delayed over one second are dropped
    fail-closed instead of building a stale work queue.
-7. On `quote_accepted`, validate the exchange-reported accepted count, reload every
-   latest leg fair, rebuild the full parlay fair, recompute the accepted-size fee, and
-   confirm only if the configured net proportional edge still remains.
+7. On `quote_accepted`, record acceptance-age and structure telemetry, validate the
+   exchange-reported accepted count, reload every latest leg fair, rebuild the full
+   parlay fair, recompute the accepted-size fee, and
+   atomically reserve one session execution before confirming. Confirm only if the
+   configured net proportional edge still remains. In first-fill-wins mode, immediately
+   cancel every other displayed quote after the atomic gate selects a winner.
 8. Retain the exposure reservation through Kalshi's execution timer, reconcile it from
    quote and portfolio state, and release it after execution or cancellation. Record
    every observed fill, its legs, quote, fair, actual or modeled fee, and gross/net edge

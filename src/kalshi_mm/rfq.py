@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import math
 import time
+from collections import deque
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -16,22 +16,32 @@ from .client import KalshiAPIError, KalshiClient
 from .matching import match_events, normalize_name
 from .models import ONE, ZERO, PriceGrid, as_decimal
 from .odds import DEFAULT_SHARP_BOOKMAKERS, OddsClient, OddsEvent
-from .scanner import consensus_probability
+from .scanner import (
+    consensus_probability,
+    consensus_spread_probability,
+    consensus_total_probability,
+    parse_full_game_spread,
+    parse_full_game_total_line,
+)
 
 RFQ_LIVE_ENABLE_TOKEN = "I_UNDERSTAND_RFQ_REAL_MONEY"
 RFQ_LIVE_ACKNOWLEDGEMENT = "REAL_MONEY_RFQ_AUTOCONFIRM"
-HARD_MIN_RFQ_EDGE_RATE = Decimal("0.01")
+HARD_MIN_RFQ_EDGE_RATE = Decimal("0.0075")
 KALSHI_MAKER_FEE_RATE = Decimal("0.0175")
 KALSHI_FEE_INCREMENT = Decimal("0.0001")
 KALSHI_RFQ_PRICE_INCREMENT = Decimal("0.0001")
+LEAD_RFQ_PRICE_INCREMENT = Decimal("0.001")
 UNSUPPORTED_AUDIT_BATCH_SIZE = 1_000
+COVERAGE_AUDIT_BATCH_SIZE = 1_000
 PREPARE_MARKET_BATCH_SIZE = 4
 PREPARE_MARKET_BATCH_SECONDS = 1.0
 HVM_RFQ_TERMINAL_GRACE_SECONDS = 5.0
 STANDARD_RFQ_TERMINAL_GRACE_SECONDS = 46.0
 AGGREGATED_RFQ_SKIP_REASONS = {
     "RFQ has no side within position and notional limits",
+    "RFQ quote would exceed the session notional limit",
     "RFQ size exceeds the per-request contract limit",
+    "RFQ target cost exceeds the configured limit",
     "RFQ session execution limit reached",
     "target-cost RFQs are disabled",
 }
@@ -124,6 +134,8 @@ class MoneylineFair:
     source: str
     event_ticker: str = ""
     participants: frozenset[str] = frozenset()
+    market_type: str = "moneyline"
+    sport: str = "mlb"
 
     def validate(self) -> None:
         if not ZERO < self.probability < ONE:
@@ -173,6 +185,8 @@ class JsonMoneylineFairBook:
                 for item in participants_raw
                 if normalize_name(str(item))
             ),
+            market_type=market_type,
+            sport=str(raw.get("sport", "mlb")).casefold().strip(),
         )
         fair.validate()
         return fair
@@ -206,7 +220,7 @@ class JsonMoneylineFairBook:
 
 
 class OddsMoneylineFairBook:
-    """Periodically refresh a league, then serve RFQs from an in-memory fair cache."""
+    """Periodically refresh one safely mapped sports-market lane."""
 
     def __init__(
         self,
@@ -221,9 +235,11 @@ class OddsMoneylineFairBook:
         max_source_age_seconds: float = 60,
         match_window_hours: float = 6,
         refresh_seconds: float = 30,
+        market_type: str = "h2h",
+        allow_three_way: bool = False,
     ) -> None:
-        if min_bookmakers < 2:
-            raise ValueError("RFQ odds consensus requires at least two bookmakers")
+        if min_bookmakers < 1:
+            raise ValueError("RFQ odds pricing requires at least one bookmaker")
         if max_source_age_seconds <= 0 or refresh_seconds <= 0:
             raise ValueError("RFQ odds freshness intervals must be positive")
         self.kalshi = kalshi
@@ -236,6 +252,10 @@ class OddsMoneylineFairBook:
         self.max_source_age_seconds = max_source_age_seconds
         self.match_window_hours = match_window_hours
         self.refresh_seconds = refresh_seconds
+        if market_type not in {"h2h", "totals", "spreads"}:
+            raise ValueError("RFQ odds market type must be h2h, totals, or spreads")
+        self.market_type = market_type
+        self.allow_three_way = allow_three_way
         self._values: dict[str, MoneylineFair] = {}
 
     @staticmethod
@@ -253,14 +273,18 @@ class OddsMoneylineFairBook:
             found = True
         return found
 
-    @staticmethod
-    def _oldest_selected_update(event: OddsEvent, selected: set[str]) -> datetime | None:
+    def _oldest_selected_update(
+        self,
+        event: OddsEvent,
+        selected: set[str],
+    ) -> datetime | None:
         updates = [
             market.last_update or bookmaker.last_update
             for bookmaker in event.bookmakers
             if bookmaker.key in selected
             for market in bookmaker.markets
-            if market.key == "h2h" and (market.last_update or bookmaker.last_update) is not None
+            if market.key == self.market_type
+            and (market.last_update or bookmaker.last_update) is not None
         ]
         return min(updates) if len(updates) >= len(selected) else None
 
@@ -273,13 +297,13 @@ class OddsMoneylineFairBook:
         odds_events = self.odds.get_odds(
             self.sport,
             regions=self.regions,
-            markets="h2h",
+            markets=self.market_type,
             bookmakers=self.bookmakers,
         )
         now = datetime.now(UTC)
-        odds_events = [
-            event for event in odds_events if event.commence_time > now and self._is_two_way(event)
-        ]
+        odds_events = [event for event in odds_events if event.commence_time > now]
+        if self.market_type == "h2h" and not self.allow_three_way:
+            odds_events = [event for event in odds_events if self._is_two_way(event)]
         matches = match_events(
             kalshi_events,
             odds_events,
@@ -302,13 +326,45 @@ class OddsMoneylineFairBook:
                 outcome = str(market.get("yes_sub_title", ""))
                 if not ticker or not outcome:
                     continue
-                consensus = consensus_probability(
-                    match.odds_event,
-                    outcome,
-                    min_bookmakers=self.min_bookmakers,
-                    max_age_seconds=self.max_source_age_seconds,
-                    now=now,
-                )
+                if self.market_type == "totals":
+                    line = parse_full_game_total_line(
+                        outcome,
+                        event_title=str(match.kalshi_event.get("title", "")),
+                        market_title=str(market.get("title", "")),
+                    )
+                    consensus = (
+                        consensus_total_probability(
+                            match.odds_event,
+                            line,
+                            min_bookmakers=self.min_bookmakers,
+                            max_age_seconds=self.max_source_age_seconds,
+                            now=now,
+                        )
+                        if line is not None
+                        else None
+                    )
+                elif self.market_type == "spreads":
+                    spread = parse_full_game_spread(outcome)
+                    consensus = (
+                        consensus_spread_probability(
+                            match.odds_event,
+                            spread[0],
+                            spread[1],
+                            min_bookmakers=self.min_bookmakers,
+                            max_age_seconds=self.max_source_age_seconds,
+                            now=now,
+                        )
+                        if spread is not None
+                        else None
+                    )
+                else:
+                    consensus = consensus_probability(
+                        match.odds_event,
+                        outcome,
+                        min_bookmakers=self.min_bookmakers,
+                        max_age_seconds=self.max_source_age_seconds,
+                        now=now,
+                    )
                 if consensus is None:
                     continue
                 source_update = self._oldest_selected_update(
@@ -324,6 +380,18 @@ class OddsMoneylineFairBook:
                     source="odds-consensus:" + ",".join(consensus.bookmaker_keys),
                     event_ticker=event_ticker,
                     participants=participants,
+                    market_type={
+                        "h2h": "moneyline",
+                        "totals": "total",
+                        "spreads": "spread",
+                    }[self.market_type],
+                    sport={
+                        "baseball_mlb": "mlb",
+                        "basketball_wnba": "wnba",
+                        "soccer_usa_mls": "mls",
+                        "soccer_mexico_ligamx": "liga_mx",
+                        "mma_mixed_martial_arts": "ufc",
+                    }.get(self.sport, self.sport.casefold().strip()),
                 )
                 fair.validate()
                 refreshed[fair.ticker] = fair
@@ -337,6 +405,39 @@ class OddsMoneylineFairBook:
 
     def tickers(self) -> tuple[str, ...]:
         return tuple(sorted(self._values))
+
+
+class CompositeMoneylineFairBook:
+    """Merge independently refreshed sport/market lanes into one fail-closed cache."""
+
+    def __init__(self, books: tuple[MoneylineFairBook, ...]) -> None:
+        if not books:
+            raise ValueError("composite RFQ fair book requires at least one lane")
+        self.books = books
+        self.refresh_seconds = min(book.refresh_seconds for book in books)
+
+    def refresh(self) -> tuple[str, ...]:
+        refreshed = False
+        errors: list[str] = []
+        for book in self.books:
+            try:
+                book.refresh()
+                refreshed = True
+            except ValueError as exc:
+                errors.append(str(exc))
+        if not refreshed and not self.tickers():
+            raise ValueError("no configured RFQ lane refreshed: " + "; ".join(errors))
+        return self.tickers()
+
+    def get(self, ticker: str) -> MoneylineFair | None:
+        matches = [book.get(ticker) for book in self.books]
+        values = [item for item in matches if item is not None]
+        if len(values) > 1:
+            raise ValueError(f"multiple RFQ fair lanes produced {ticker}")
+        return values[0] if values else None
+
+    def tickers(self) -> tuple[str, ...]:
+        return tuple(sorted({ticker for book in self.books for ticker in book.tickers()}))
 
 
 @dataclass(frozen=True, slots=True)
@@ -375,6 +476,7 @@ class RFQRequest:
     target_cost: Decimal | None = None
     collection_ticker: str = ""
     legs: tuple[RFQLeg, ...] = ()
+    creator_id: str = ""
 
     @property
     def is_combo(self) -> bool:
@@ -412,6 +514,7 @@ class RFQRequest:
             target_cost=target_cost,
             collection_ticker=str(payload.get("mve_collection_ticker", "")).strip(),
             legs=tuple(RFQLeg.from_payload(raw) for raw in legs_raw),
+            creator_id=str(payload.get("creator_id", "")).strip(),
         )
         size = request.contracts if request.contracts is not None else request.target_cost
         if not request.rfq_id or not request.ticker or size is None or size <= ZERO:
@@ -454,9 +557,16 @@ class RFQQuotePlan:
     def _target_contracts(target_cost: Decimal, bid: Decimal) -> Decimal:
         if bid <= ZERO:
             return ZERO
-        # Kalshi derives the exact count. Round up to the next 0.01 contract so
-        # local risk is never smaller than the exchange-derived quote size.
-        return (target_cost / bid).quantize(Decimal("0.01"), rounding=ROUND_CEILING)
+        requester_price = ONE - bid
+        if requester_price <= ZERO:
+            raise ValueError("target-cost RFQ bid leaves no positive requester price")
+        # The requester takes the outcome opposite our bid, paying (1 - bid)
+        # plus a nonnegative requester fee. Ignoring that fee and rounding up
+        # therefore bounds Kalshi's exchange-derived contract count from above.
+        return (target_cost / requester_price).quantize(
+            Decimal("0.01"),
+            rounding=ROUND_CEILING,
+        )
 
     @property
     def yes_contracts(self) -> Decimal:
@@ -492,6 +602,11 @@ class RFQQuotePlan:
             ),
             "yes_contracts_reserved": str(self.yes_contracts),
             "no_contracts_reserved": str(self.no_contracts),
+            "contracts_reservation_basis": (
+                "fixed"
+                if self.request.contracts is not None
+                else "target_cost_complement_price_upper_bound"
+            ),
             "collection_ticker": self.request.collection_ticker or None,
             "legs": [leg.as_dict() for leg in self.request.legs],
             "fair_probability": str(self.fair.probability),
@@ -539,7 +654,7 @@ def price_moneyline_rfq(
     maker_fee_rate = as_decimal(maker_fee_rate)
     maker_fee_multiplier = as_decimal(maker_fee_multiplier)
     if not HARD_MIN_RFQ_EDGE_RATE <= edge_rate < ONE:
-        raise ValueError("RFQ proportional edge must be in [1%, 100%)")
+        raise ValueError("RFQ proportional edge must be in [0.75%, 100%)")
     if maker_fee_rate < ZERO or maker_fee_multiplier < ZERO:
         raise ValueError("RFQ maker-fee inputs cannot be negative")
 
@@ -598,17 +713,133 @@ def price_moneyline_rfq(
     return plan
 
 
+def price_lead_style_rfq(
+    request: RFQRequest,
+    fair: MoneylineFair,
+    *,
+    price_grid: PriceGrid,
+    margin: Decimal = Decimal("0.006"),
+    minimum_cushion: Decimal = Decimal("0.007"),
+    two_leg_premium: Decimal = Decimal("0.009"),
+    player_prop_premium: Decimal = Decimal("0.005"),
+    soccer_premium: Decimal = Decimal("0.005"),
+    maker_fee_rate: Decimal = KALSHI_MAKER_FEE_RATE,
+    maker_fee_multiplier: Decimal = ZERO,
+    leg_fairs: tuple[MoneylineFair, ...] = (),
+) -> RFQQuotePlan:
+    """Quote only NO at de-vigged fair minus a fixed, boundary-capped margin."""
+    inputs = tuple(
+        as_decimal(item)
+        for item in (
+            margin,
+            minimum_cushion,
+            two_leg_premium,
+            player_prop_premium,
+            soccer_premium,
+            maker_fee_rate,
+            maker_fee_multiplier,
+        )
+    )
+    (
+        margin,
+        minimum_cushion,
+        two_leg_premium,
+        player_prop_premium,
+        soccer_premium,
+        maker_fee_rate,
+        maker_fee_multiplier,
+    ) = inputs
+    if any(item < ZERO for item in inputs):
+        raise ValueError("lead-style RFQ pricing inputs cannot be negative")
+
+    premium = ZERO
+    if len(request.legs) == 2:
+        premium += two_leg_premium
+    if any(item.market_type == "player_prop" for item in leg_fairs):
+        premium += player_prop_premium
+    if any(item.sport in {"mls", "liga_mx"} for item in leg_fairs):
+        premium += soccer_premium
+    required_cushion = minimum_cushion + premium
+    boundary_cushion = min(fair.probability, ONE - fair.probability)
+    if boundary_cushion < required_cushion:
+        raise ValueError("parlay fair-value cushion is below the configured floor")
+    effective_margin = min(margin + premium, boundary_cushion / Decimal("2"))
+    no_fair = ONE - fair.probability
+
+    def contracts_for(bid: Decimal) -> Decimal:
+        if request.contracts is not None:
+            return request.contracts
+        assert request.target_cost is not None
+        return RFQQuotePlan._target_contracts(request.target_cost, bid)
+
+    def lead_grid_floor(price: Decimal) -> Decimal:
+        candidate = (
+            price / LEAD_RFQ_PRICE_INCREMENT
+        ).to_integral_value(rounding="ROUND_FLOOR") * LEAD_RFQ_PRICE_INCREMENT
+        while candidate >= price_grid.minimum_order_price:
+            if price_grid.floor(candidate) == candidate:
+                return candidate
+            candidate -= LEAD_RFQ_PRICE_INCREMENT
+        return ZERO
+
+    def previous_bid(bid: Decimal) -> Decimal:
+        return lead_grid_floor(bid - LEAD_RFQ_PRICE_INCREMENT)
+
+    raw = no_fair - effective_margin
+    no_bid = lead_grid_floor(raw) if raw >= price_grid.minimum_order_price else ZERO
+    no_edge_rate: Decimal | None = None
+    no_gross_edge_rate: Decimal | None = None
+    no_fee = ZERO
+    while no_bid >= price_grid.minimum_order_price:
+        contracts = contracts_for(no_bid)
+        gross, fee, net = modeled_rfq_edge(
+            no_fair,
+            no_bid,
+            contracts,
+            fee_rate=maker_fee_rate,
+            fee_multiplier=maker_fee_multiplier,
+        )
+        net_margin_per_contract = no_fair - no_bid - fee / contracts
+        if net_margin_per_contract >= effective_margin:
+            no_edge_rate = net
+            no_gross_edge_rate = gross
+            no_fee = fee
+            break
+        no_bid = previous_bid(no_bid)
+    if no_bid < price_grid.minimum_order_price:
+        raise ValueError("fair value is too close to a boundary to quote NO")
+    return RFQQuotePlan(
+        request=request,
+        fair=fair,
+        yes_bid=ZERO,
+        no_bid=no_bid,
+        yes_edge_rate=None,
+        no_edge_rate=no_edge_rate,
+        yes_gross_edge_rate=None,
+        no_gross_edge_rate=no_gross_edge_rate,
+        yes_estimated_fee=ZERO,
+        no_estimated_fee=no_fee,
+        maker_fee_rate=maker_fee_rate,
+        maker_fee_multiplier=maker_fee_multiplier,
+        leg_fairs=leg_fairs,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class RFQMakerConfig:
-    edge_rate: Decimal = Decimal("0.02")
+    edge_rate: Decimal = Decimal("0.011")
     maker_fee_rate: Decimal = KALSHI_MAKER_FEE_RATE
     min_contracts: Decimal = Decimal("1")
     max_contracts: Decimal = Decimal("10")
+    max_target_cost: Decimal | None = None
     max_abs_position: Decimal = Decimal("10")
     max_notional: Decimal = Decimal("10")
+    max_session_notional: Decimal | None = None
     max_session_contracts: Decimal | None = None
     max_session_executions: int | None = None
     max_active_quotes: int = 20
+    first_fill_wins: bool = False
+    allow_existing_positions: bool = False
     max_unaccepted_quote_age_seconds: float | None = None
     max_fair_age_seconds: float = 60
     reconcile_seconds: float = 15
@@ -620,19 +851,48 @@ class RFQMakerConfig:
     max_quote_latency_seconds: float = 1.0
     combo_only: bool = False
     contracts_only: bool = False
+    coverage_shadow: bool = False
     require_subaccount_metadata: bool = False
+    pricing_mode: str = "proportional"
+    no_side_only: bool = False
+    pinnacle_only: bool = False
+    max_hours_to_start: float | None = None
+    moneyline_yes_only: bool = False
+    max_moneyline_fair: Decimal | None = None
+    fixed_margin: Decimal = Decimal("0.006")
+    minimum_cushion: Decimal = Decimal("0.007")
+    two_leg_premium: Decimal = Decimal("0.009")
+    player_prop_premium: Decimal = Decimal("0.005")
+    soccer_premium: Decimal = Decimal("0.005")
+    per_leg_outcome_notional_cap: Decimal | None = None
+    per_combo_notional_cap: Decimal | None = None
+    creator_rate_limit: bool = False
+    creator_burst_limit: int = 2
+    creator_burst_window_seconds: float = 10
+    required_active_sports: tuple[str, ...] = ()
 
     def validate(self) -> None:
-        if not HARD_MIN_RFQ_EDGE_RATE <= self.edge_rate < ONE:
-            raise ValueError("RFQ proportional edge must be in [1%, 100%)")
+        if self.pricing_mode not in {"proportional", "lead_fixed"}:
+            raise ValueError("RFQ pricing mode must be proportional or lead_fixed")
+        if (
+            self.pricing_mode == "proportional"
+            and not HARD_MIN_RFQ_EDGE_RATE <= self.edge_rate < ONE
+        ):
+            raise ValueError("RFQ proportional edge must be in [0.75%, 100%)")
         if self.maker_fee_rate < KALSHI_MAKER_FEE_RATE:
             raise ValueError("RFQ maker-fee rate cannot be below Kalshi's published 1.75% rate")
         if self.min_contracts <= ZERO or self.max_contracts < self.min_contracts:
             raise ValueError("RFQ contract limits must be positive and ordered")
+        if self.max_target_cost is not None and self.max_target_cost <= ZERO:
+            raise ValueError("RFQ target-cost limit must be positive when configured")
+        if self.contracts_only and self.max_target_cost is not None:
+            raise ValueError("contracts-only RFQ mode cannot configure a target-cost limit")
         if self.max_abs_position <= ZERO:
             raise ValueError("RFQ contract and position limits must be positive")
         if self.max_notional <= ZERO or self.max_active_quotes <= 0:
             raise ValueError("RFQ notional and active-quote limits must be positive")
+        if self.max_session_notional is not None and self.max_session_notional <= ZERO:
+            raise ValueError("RFQ session notional limit must be positive when configured")
         if self.max_unaccepted_quote_age_seconds is not None and (
             not math.isfinite(self.max_unaccepted_quote_age_seconds)
             or self.max_unaccepted_quote_age_seconds <= 0
@@ -642,6 +902,8 @@ class RFQMakerConfig:
             raise ValueError("RFQ session contract limit must be positive when configured")
         if self.max_session_executions is not None and self.max_session_executions <= 0:
             raise ValueError("RFQ session execution limit must be positive when configured")
+        if self.first_fill_wins and self.max_session_executions != 1:
+            raise ValueError("first-fill-wins quoting requires exactly one session execution")
         if self.max_fair_age_seconds <= 0:
             raise ValueError("RFQ maximum fair age must be positive")
         if not 1 <= self.reconcile_seconds <= 60:
@@ -654,6 +916,24 @@ class RFQMakerConfig:
             raise ValueError("RFQ in-flight handler limit must be positive")
         if not 0.1 <= self.max_quote_latency_seconds <= 5:
             raise ValueError("RFQ maximum quote latency must be between 0.1 and 5 seconds")
+        if self.max_hours_to_start is not None and self.max_hours_to_start <= 0:
+            raise ValueError("maximum hours to game start must be positive")
+        if self.max_moneyline_fair is not None and not ZERO < self.max_moneyline_fair < ONE:
+            raise ValueError("maximum moneyline fair must be in (0, 1)")
+        fixed_inputs = (
+            self.fixed_margin,
+            self.minimum_cushion,
+            self.two_leg_premium,
+            self.player_prop_premium,
+            self.soccer_premium,
+        )
+        if any(item < ZERO for item in fixed_inputs):
+            raise ValueError("lead-style margin, floor, and premiums cannot be negative")
+        for cap in (self.per_leg_outcome_notional_cap, self.per_combo_notional_cap):
+            if cap is not None and cap <= ZERO:
+                raise ValueError("RFQ exposure caps must be positive when configured")
+        if self.creator_burst_limit <= 0 or self.creator_burst_window_seconds <= 0:
+            raise ValueError("creator burst limits must be positive")
 
 
 @dataclass(slots=True)
@@ -771,20 +1051,100 @@ class RFQRiskLedger:
         self.available_balance = available_balance
         self.reservations: dict[str, QuoteReservation] = {}
         self.executed_contracts = ZERO
+        self.executed_notional = ZERO
         self.executed_quotes = 0
+        self.executed_combo_notional: dict[str, Decimal] = {}
+        self.executed_leg_outcome_notional: dict[str, Decimal] = {}
+
+    @staticmethod
+    def _leg_outcome_keys(plan: RFQQuotePlan) -> tuple[str, ...]:
+        return tuple(
+            f"{leg.market_ticker}:{leg.side}" for leg in plan.request.legs
+        )
+
+    @staticmethod
+    def _side_cost(plan: RFQQuotePlan, side: str, contracts: Decimal | None = None) -> Decimal:
+        bid = plan.yes_bid if side == "yes" else plan.no_bid
+        count = contracts if contracts is not None else plan.contracts_for(side)
+        fee = estimated_maker_fee(
+            bid,
+            count,
+            fee_rate=plan.maker_fee_rate,
+            fee_multiplier=plan.maker_fee_multiplier,
+        )
+        return bid * count + fee
+
+    def _reserved_notional_for_combo(self, ticker: str) -> Decimal:
+        values = [
+            item.plan.maximum_cost
+            for item in self.reservations.values()
+            if item.plan.request.ticker == ticker
+        ]
+        return max(values, default=ZERO) if self.config.first_fill_wins else sum(values, ZERO)
+
+    def _reserved_notional_for_leg(self, key: str) -> Decimal:
+        values = [
+            item.plan.maximum_cost
+            for item in self.reservations.values()
+            if key in self._leg_outcome_keys(item.plan)
+        ]
+        return max(values, default=ZERO) if self.config.first_fill_wins else sum(values, ZERO)
+
+    def _ensure_exposure_caps(
+        self,
+        plan: RFQQuotePlan,
+        *,
+        cost: Decimal | None = None,
+        exclude_rfq_id: str | None = None,
+    ) -> None:
+        cost = plan.maximum_cost if cost is None else cost
+        reservations = self.reservations
+        excluded = reservations.pop(exclude_rfq_id, None) if exclude_rfq_id else None
+        try:
+            combo_cap = self.config.per_combo_notional_cap
+            if combo_cap is not None:
+                used = self.executed_combo_notional.get(plan.request.ticker, ZERO)
+                used += self._reserved_notional_for_combo(plan.request.ticker)
+                if used + cost > combo_cap:
+                    raise ValueError("RFQ exceeds the per-combo cumulative notional cap")
+            leg_cap = self.config.per_leg_outcome_notional_cap
+            if leg_cap is not None:
+                for key in self._leg_outcome_keys(plan):
+                    used = self.executed_leg_outcome_notional.get(key, ZERO)
+                    used += self._reserved_notional_for_leg(key)
+                    if used + cost > leg_cap:
+                        raise ValueError(
+                            "RFQ exceeds the per-leg-outcome cumulative notional cap"
+                        )
+        finally:
+            if excluded is not None and exclude_rfq_id is not None:
+                reservations[exclude_rfq_id] = excluded
 
     def _reserved_balance(self) -> Decimal:
-        return sum(
-            (reservation.plan.maximum_cost for reservation in self.reservations.values()),
-            ZERO,
-        )
+        costs = [reservation.plan.maximum_cost for reservation in self.reservations.values()]
+        if self.config.first_fill_wins:
+            return max(costs, default=ZERO)
+        return sum(costs, ZERO)
+
+    def _projected_reserved_balance(self, plan: RFQQuotePlan) -> Decimal:
+        if self.config.first_fill_wins:
+            return max(self._reserved_balance(), plan.maximum_cost)
+        return self._reserved_balance() + plan.maximum_cost
 
     def constrain(self, plan: RFQQuotePlan) -> RFQQuotePlan:
         if self.config.contracts_only and plan.request.contracts is None:
             raise ValueError("target-cost RFQs are disabled")
         if (
+            plan.request.target_cost is not None
+            and self.config.max_target_cost is not None
+            and plan.request.target_cost > self.config.max_target_cost
+        ):
+            raise ValueError("RFQ target cost exceeds the configured limit")
+        if (
             self.config.max_session_executions is not None
-            and self.executed_quotes >= self.config.max_session_executions
+            and self.executed_quotes
+            + sum(item.accepted_side is not None for item in self.reservations.values())
+            >= self.config.max_session_executions
         ):
             raise ValueError("RFQ session execution limit reached")
         if plan.request.contracts is not None:
@@ -794,6 +1154,7 @@ class RFQRiskLedger:
                 raise ValueError("RFQ size exceeds the per-request contract limit")
         if len(self.reservations) >= self.config.max_active_quotes:
             raise ValueError("active RFQ quote limit reached")
+        self._ensure_exposure_caps(plan)
         position = self.positions.get(plan.request.ticker, ZERO)
         long_reserve = sum(
             (
@@ -811,6 +1172,11 @@ class RFQRiskLedger:
             ),
             ZERO,
         )
+        if self.config.first_fill_wins:
+            # Outstanding quotes are conditional alternatives: the atomic
+            # acceptance gate below permits at most one of them to confirm.
+            long_reserve = ZERO
+            short_reserve = ZERO
         yes_bid = plan.yes_bid
         no_bid = plan.no_bid
         yes_contracts = plan.yes_contracts
@@ -823,6 +1189,8 @@ class RFQRiskLedger:
                 ),
                 ZERO,
             )
+            if self.config.first_fill_wins:
+                reserved_contracts = ZERO
             remaining_contracts = (
                 self.config.max_session_contracts
                 - self.executed_contracts
@@ -859,7 +1227,14 @@ class RFQRiskLedger:
         )
         if not constrained.has_side:
             raise ValueError("RFQ has no side within position and notional limits")
-        if self._reserved_balance() + constrained.maximum_cost > self.available_balance:
+        if (
+            self.config.max_session_notional is not None
+            and self.executed_notional
+            + self._projected_reserved_balance(constrained)
+            > self.config.max_session_notional
+        ):
+            raise ValueError("RFQ quote would exceed the session notional limit")
+        if self._projected_reserved_balance(constrained) > self.available_balance:
             raise ValueError("RFQ quote would exceed unreserved available balance")
         return constrained
 
@@ -876,6 +1251,35 @@ class RFQRiskLedger:
             (item for item in self.reservations.values() if item.quote_id == quote_id),
             None,
         )
+
+    def mark_acceptance(
+        self,
+        reservation: QuoteReservation,
+        *,
+        side: str,
+        contracts: Decimal,
+    ) -> None:
+        if reservation.accepted_side is not None:
+            raise ValueError("RFQ quote acceptance was already recorded")
+        cost = self._side_cost(reservation.plan, side, contracts)
+        self._ensure_exposure_caps(
+            reservation.plan,
+            cost=cost,
+            exclude_rfq_id=reservation.plan.request.rfq_id,
+        )
+        if self.config.max_session_executions is not None:
+            accepted_quotes = sum(
+                item.accepted_side is not None
+                for item in self.reservations.values()
+                if item is not reservation
+            )
+            if (
+                self.executed_quotes + accepted_quotes
+                >= self.config.max_session_executions
+            ):
+                raise ValueError("RFQ session execution limit reached before confirmation")
+        reservation.accepted_side = side
+        reservation.accepted_contracts = contracts
 
     def record_execution(self, reservation: QuoteReservation) -> None:
         side = reservation.accepted_side
@@ -895,6 +1299,15 @@ class RFQRiskLedger:
             fee_rate=reservation.plan.maker_fee_rate,
             fee_multiplier=reservation.plan.maker_fee_multiplier,
         )
+        self.executed_notional += price * count + fee
+        cost = price * count + fee
+        self.executed_combo_notional[ticker] = (
+            self.executed_combo_notional.get(ticker, ZERO) + cost
+        )
+        for key in self._leg_outcome_keys(reservation.plan):
+            self.executed_leg_outcome_notional[key] = (
+                self.executed_leg_outcome_notional.get(key, ZERO) + cost
+            )
         self.available_balance = max(self.available_balance - price * count - fee, ZERO)
 
 
@@ -921,6 +1334,8 @@ class RFQMaker:
         allowed_collections: set[str] | None = None,
     ) -> None:
         config.validate()
+        if execute and config.coverage_shadow:
+            raise ValueError("RFQ coverage shadow cannot submit quotes")
         self.client = client
         self.stream = stream
         self.fair_book = fair_book
@@ -942,6 +1357,14 @@ class RFQMaker:
         self._tasks: set[asyncio.Task[None]] = set()
         self._rfq_tails: dict[str, asyncio.Task[None]] = {}
         self._unsupported_counts: dict[str, int] = {}
+        self._coverage_counts: dict[str, dict[str, int]] = {}
+        self._coverage_messages = 0
+        self._existing_position_events: set[str] = set()
+        self._existing_position_participants: set[str] = set()
+        self._creator_arrivals: dict[str, deque[float]] = {}
+        self._blocked_creators: set[str] = set()
+        self._combo_request_counts: dict[str, int] = {}
+        self._rfq_ids_seen: set[str] = set()
 
     def _audit(self, event: str, payload: dict[str, object]) -> None:
         self.audit_log.append(event, payload)
@@ -965,29 +1388,113 @@ class RFQMaker:
         if sum(self._unsupported_counts.values()) >= UNSUPPORTED_AUDIT_BATCH_SIZE:
             self._flush_unsupported_summary()
 
-    def _prefilter_created(self, message: dict[str, Any]) -> str | None:
+    @staticmethod
+    def _coverage_outcome(reason: str) -> str:
+        if reason.startswith("fair value is stale"):
+            return "fair value is stale"
+        if reason.startswith("active RFQ exposure overlaps an event"):
+            return "active RFQ exposure overlaps an event"
+        if reason.startswith("active RFQ exposure overlaps a participant"):
+            return "active RFQ exposure overlaps a participant"
+        if "rfq_closed" in reason.casefold() or "RFQ closed" in reason:
+            return "RFQ closed before quote submission"
+        return reason
+
+    def _flush_coverage_summary(self) -> None:
+        if not self._coverage_messages:
+            return
+        sizing = {
+            mode: dict(sorted(outcomes.items()))
+            for mode, outcomes in sorted(self._coverage_counts.items())
+        }
+        messages = self._coverage_messages
+        self._coverage_counts.clear()
+        self._coverage_messages = 0
+        self._audit(
+            "rfq_coverage_summary",
+            {
+                "messages": messages,
+                "sizing": sizing,
+                "execute": self.execute,
+                "coverage_shadow": self.config.coverage_shadow,
+            },
+        )
+        repeated = sum(max(0, count - 1) for count in self._combo_request_counts.values())
+        self._audit(
+            "rfq_unique_combo_summary",
+            {
+                "unique_rfqs": len(self._rfq_ids_seen),
+                "unique_combos": len(self._combo_request_counts),
+                "repeat_rfqs": repeated,
+                "top_combos": [
+                    {"ticker": ticker, "requests": count}
+                    for ticker, count in sorted(
+                        self._combo_request_counts.items(),
+                        key=lambda item: (-item[1], item[0]),
+                    )[:10]
+                ],
+            },
+        )
+
+    def _record_coverage(self, sizing_mode: str, outcome: str) -> None:
+        mode = sizing_mode if sizing_mode in {"contracts", "target_cost"} else "invalid"
+        outcomes = self._coverage_counts.setdefault(mode, {})
+        normalized = self._coverage_outcome(outcome)
+        outcomes[normalized] = outcomes.get(normalized, 0) + 1
+        self._coverage_messages += 1
+        if self._coverage_messages >= COVERAGE_AUDIT_BATCH_SIZE:
+            self._flush_coverage_summary()
+
+    def _prefilter_created(self, message: dict[str, Any]) -> tuple[str | None, str]:
         payload = message.get("msg")
         if not isinstance(payload, dict):
-            return None
+            return None, "invalid"
         try:
             request = RFQRequest.from_message(message)
         except (InvalidOperation, TypeError, ValueError):
-            return "invalid RFQ shape"
+            return "invalid RFQ shape", "invalid"
+        self._rfq_ids_seen.add(request.rfq_id)
+        if request.is_combo:
+            self._combo_request_counts[request.ticker] = (
+                self._combo_request_counts.get(request.ticker, 0) + 1
+            )
         if not request.is_combo:
             if self.config.combo_only:
-                return "single-market RFQs are disabled"
+                return "single-market RFQs are disabled", request.sizing_mode
             if not self._ticker_allowed(request.ticker):
-                return "ticker is not on the moneyline allowlist"
-            return None
+                return "ticker is not on the moneyline allowlist", request.sizing_mode
+            return None, request.sizing_mode
         if self.config.contracts_only and request.contracts is None:
-            return "target-cost RFQs are disabled"
+            return "target-cost RFQs are disabled", request.sizing_mode
         if self.allowed_collections and request.collection_ticker not in self.allowed_collections:
-            return "MVE collection is not on the allowlist"
+            return "MVE collection is not on the allowlist", request.sizing_mode
         if not self.config.min_legs <= len(request.legs) <= self.config.max_legs:
-            return "parlay leg count is outside configured limits"
+            return "parlay leg count is outside configured limits", request.sizing_mode
         if any(not self._ticker_allowed(leg.market_ticker) for leg in request.legs):
-            return "ticker is not on the moneyline allowlist"
-        return None
+            return "ticker is not on the moneyline allowlist", request.sizing_mode
+        return None, request.sizing_mode
+
+    async def _enforce_creator_rate(self, request: RFQRequest) -> RFQRequest:
+        if not self.config.creator_rate_limit:
+            return request
+        creator_id = request.creator_id
+        if not creator_id:
+            raw = await asyncio.to_thread(self.client.get_rfq, request.rfq_id)
+            creator_id = str(raw.get("creator_id", "")).strip()
+        if not creator_id:
+            raise ValueError("RFQ creator identity is unavailable")
+        if creator_id in self._blocked_creators:
+            raise ValueError("RFQ creator is blocked for burst posting")
+        now = time.monotonic()
+        arrivals = self._creator_arrivals.setdefault(creator_id, deque())
+        cutoff = now - self.config.creator_burst_window_seconds
+        while arrivals and arrivals[0] < cutoff:
+            arrivals.popleft()
+        if len(arrivals) >= self.config.creator_burst_limit:
+            self._blocked_creators.add(creator_id)
+            raise ValueError("RFQ creator exceeded the burst-posting limit")
+        arrivals.append(now)
+        return replace(request, creator_id=creator_id)
 
     def _record_fill(
         self,
@@ -1110,21 +1617,39 @@ class RFQMaker:
     def _require_expected_subaccount(self, payload: dict[str, Any]) -> None:
         if not self.config.require_subaccount_metadata:
             return
-        raw = payload.get("subaccount", payload.get("creator_subaccount"))
+        raw = payload.get("subaccount")
+        if raw is None:
+            raw = payload.get("creator_subaccount")
+        # Kalshi omits/nulls this field for the primary account and returns it
+        # when a numbered subaccount is involved. The quote ID has already been
+        # matched to a reservation created by this authenticated process.
+        if raw is None and self.config.subaccount == 0:
+            return
         if raw is None or int(raw) != self.config.subaccount:
             raise ValueError("RFQ message subaccount is missing or does not match the canary")
+
+    @staticmethod
+    def _accepted_contracts(payload: dict[str, Any], side: str) -> Decimal:
+        for key in (
+            "contracts_accepted_fp",
+            f"{side}_contracts_offered_fp",
+            f"{side}_contracts_fp",
+            "contracts_fp",
+        ):
+            raw = payload.get(key)
+            if raw is None or raw == "":
+                continue
+            count = as_decimal(raw)
+            if count > ZERO:
+                return count
+        return ZERO
 
     @staticmethod
     def _recover_acceptance(reservation: QuoteReservation, quote: dict[str, Any]) -> None:
         side = str(quote.get("accepted_side", "")).casefold()
         if side not in {"yes", "no"}:
             raise ValueError("executed quote is missing its accepted side")
-        count = as_decimal(
-            quote.get("contracts_fp")
-            or quote.get(f"{side}_contracts_fp")
-            or quote.get(f"{side}_contracts_offered_fp")
-            or "0"
-        )
+        count = RFQMaker._accepted_contracts(quote, side)
         if count <= ZERO or count > reservation.plan.contracts_for(side):
             raise ValueError("executed quote has an invalid accepted size")
         reservation.accepted_side = side
@@ -1140,6 +1665,14 @@ class RFQMaker:
             raise ValueError(f"fair value is stale ({age:.3f}s old)")
         if not self.config.allow_live_games and now >= fair.event_start:
             raise ValueError("in-play moneyline RFQs are disabled")
+        if (
+            self.config.max_hours_to_start is not None
+            and (fair.event_start - now).total_seconds()
+            > float(self.config.max_hours_to_start) * 60 * 60
+        ):
+            raise ValueError("event is beyond the maximum pregame horizon")
+        if self.config.pinnacle_only and fair.source != "odds-consensus:pinnacle":
+            raise ValueError("fair value is not sourced exclusively from Pinnacle")
         return fair
 
     def _ticker_allowed(self, ticker: str) -> bool:
@@ -1177,6 +1710,19 @@ class RFQMaker:
             if not self._ticker_allowed(leg.market_ticker):
                 raise ValueError("parlay leg ticker is not on the moneyline allowlist")
             fair = self._fair(leg.market_ticker, now=now)
+            if (
+                self.config.moneyline_yes_only
+                and fair.market_type == "moneyline"
+                and leg.side != "yes"
+            ):
+                raise ValueError("moneyline RFQ legs must be YES selections")
+            if (
+                fair.market_type == "moneyline"
+                and leg.side == "yes"
+                and self.config.max_moneyline_fair is not None
+                and fair.probability > self.config.max_moneyline_fair
+            ):
+                raise ValueError("moneyline favorite is steeper than the configured limit")
             if not fair.event_ticker:
                 raise ValueError("parlay leg fair is missing an event ticker")
             if fair.event_ticker != leg.event_ticker:
@@ -1201,9 +1747,55 @@ class RFQMaker:
             source="parlay-product:" + ",".join(sorted({item.source for item in leg_fairs})),
             event_ticker=",".join(event_tickers),
             participants=frozenset(seen_participants),
+            market_type="parlay",
+            sport="mixed",
         )
         aggregate.validate()
         return aggregate, tuple(leg_fairs)
+
+    def _price_request(
+        self,
+        request: RFQRequest,
+        fair: MoneylineFair,
+        *,
+        grid: PriceGrid,
+        fee_multiplier: Decimal,
+        leg_fairs: tuple[MoneylineFair, ...],
+    ) -> RFQQuotePlan:
+        if self.config.pricing_mode == "lead_fixed":
+            return price_lead_style_rfq(
+                request,
+                fair,
+                price_grid=grid,
+                margin=self.config.fixed_margin,
+                minimum_cushion=self.config.minimum_cushion,
+                two_leg_premium=self.config.two_leg_premium,
+                player_prop_premium=self.config.player_prop_premium,
+                soccer_premium=self.config.soccer_premium,
+                maker_fee_rate=self.config.maker_fee_rate,
+                maker_fee_multiplier=fee_multiplier,
+                leg_fairs=leg_fairs,
+            )
+        plan = price_moneyline_rfq(
+            request,
+            fair,
+            price_grid=grid,
+            edge_rate=self.config.edge_rate,
+            maker_fee_rate=self.config.maker_fee_rate,
+            maker_fee_multiplier=fee_multiplier,
+            leg_fairs=leg_fairs,
+        )
+        if self.config.no_side_only:
+            plan = replace(
+                plan,
+                yes_bid=ZERO,
+                yes_edge_rate=None,
+                yes_gross_edge_rate=None,
+                yes_estimated_fee=ZERO,
+            )
+            if plan.no_bid <= ZERO:
+                raise ValueError("NO-only strategy has no quoteable side")
+        return plan
 
     async def _load_series_maker_fee_multiplier(self, series_ticker: str) -> Decimal:
         series = await asyncio.to_thread(self.client.get_series_details, series_ticker)
@@ -1364,31 +1956,163 @@ class RFQMaker:
             self.ledger.positions[request.ticker] = as_decimal(position)
         return grid
 
-    def _ensure_no_overlapping_reservation(self, request: RFQRequest) -> None:
+    def _plan_exposure(self, plan: RFQQuotePlan) -> tuple[set[str], set[str]]:
+        request = plan.request
         requested_events = (
             {leg.event_ticker for leg in request.legs}
             if request.is_combo
             else {self.event_tickers.get(request.ticker, "")}
         )
         requested_events.discard("")
+        requested_participants = set(plan.fair.participants)
+        return requested_events, requested_participants
+
+    def _ensure_no_overlapping_reservation(self, plan: RFQQuotePlan) -> None:
+        if self.config.first_fill_wins:
+            return
+        requested_events, requested_participants = self._plan_exposure(plan)
         for reservation in self.ledger.reservations.values():
-            other = reservation.plan.request
-            other_events = (
-                {leg.event_ticker for leg in other.legs}
-                if other.is_combo
-                else {self.event_tickers.get(other.ticker, "")}
-            )
+            other_events, other_participants = self._plan_exposure(reservation.plan)
             overlap = requested_events.intersection(other_events)
             if overlap:
                 raise ValueError(
                     "active RFQ exposure overlaps an event: " + ", ".join(sorted(overlap))
                 )
+            participant_overlap = requested_participants.intersection(other_participants)
+            if participant_overlap:
+                raise ValueError(
+                    "active RFQ exposure overlaps a participant: "
+                    + ", ".join(sorted(participant_overlap))
+                )
+
+    def _ensure_no_existing_position_overlap(self, plan: RFQQuotePlan) -> None:
+        requested_events, requested_participants = self._plan_exposure(plan)
+        event_overlap = requested_events.intersection(self._existing_position_events)
+        if event_overlap:
+            raise ValueError(
+                "RFQ exposure overlaps an existing-position event: "
+                + ", ".join(sorted(event_overlap))
+            )
+        participant_overlap = requested_participants.intersection(
+            self._existing_position_participants
+        )
+        if participant_overlap:
+            raise ValueError(
+                "RFQ exposure overlaps an existing-position participant: "
+                + ", ".join(sorted(participant_overlap))
+            )
+
+    async def _load_existing_position_exposure(
+        self,
+        positions: list[dict[str, Any]],
+    ) -> None:
+        if positions and not self.config.allow_existing_positions:
+            raise ValueError("RFQ account already has positions")
+        for position in positions:
+            ticker = str(position.get("ticker", "")).strip()
+            count = as_decimal(position.get("position_fp", "0"))
+            if not ticker or count == ZERO:
+                continue
+            market = await asyncio.to_thread(self.client.get_market, ticker)
+            collection = str(market.get("mve_collection_ticker", "")).strip()
+            raw_legs = market.get("mve_selected_legs")
+            if collection not in self.allowed_collections or not isinstance(raw_legs, list):
+                raise ValueError(
+                    "existing position is not an allowed independent-moneyline combo"
+                )
+            legs = tuple(RFQLeg.from_payload(raw) for raw in raw_legs)
+            if not self.config.min_legs <= len(legs) <= self.config.max_legs:
+                raise ValueError("existing combo position has an unsupported leg count")
+            events = {leg.event_ticker for leg in legs}
+            if len(events) != len(legs):
+                raise ValueError("existing combo position contains same-game legs")
+            participants: set[str] = set()
+            for leg in legs:
+                fair = self.fair_book.get(leg.market_ticker)
+                if fair is not None:
+                    if fair.event_ticker != leg.event_ticker:
+                        raise ValueError("existing combo leg lacks verified fair-value metadata")
+                    leg_participants = set(fair.participants)
+                else:
+                    # A held position may be past the pregame freshness horizon and
+                    # therefore absent from the current fair snapshot. Reconstruct
+                    # its teams from canonical Kalshi event metadata so continuation
+                    # can still exclude every shared participant without reusing
+                    # stale prices.
+                    leg_market = await asyncio.to_thread(
+                        self.client.get_market, leg.market_ticker
+                    )
+                    series_ticker = str(leg_market.get("series_ticker", "")).strip()
+                    if not series_ticker and "-" in leg.market_ticker:
+                        series_ticker = leg.market_ticker.split("-", 1)[0]
+                    allowed_series = {
+                        ticker.split("-", 1)[0] for ticker in self.fair_book.tickers()
+                    }
+                    if (
+                        series_ticker not in allowed_series
+                        or str(leg_market.get("event_ticker", "")).strip()
+                        != leg.event_ticker
+                        or str(leg_market.get("market_type", "")).strip() != "binary"
+                    ):
+                        raise ValueError("existing combo leg is not an allowed moneyline")
+                    leg_event = await asyncio.to_thread(
+                        self.client.get_event, leg.event_ticker
+                    )
+                    leg_participants = {
+                        normalize_name(str(item.get("yes_sub_title", "")))
+                        for item in leg_event.get("markets", [])
+                        if isinstance(item, dict)
+                        and normalize_name(str(item.get("yes_sub_title", "")))
+                        not in {"", "draw", "tie"}
+                    }
+                if len(leg_participants) < 2:
+                    raise ValueError("existing combo leg lacks participant identities")
+                overlap = participants.intersection(leg_participants)
+                if overlap:
+                    raise ValueError("existing combo position repeats a participant")
+                participants.update(leg_participants)
+            event_overlap = events.intersection(self._existing_position_events)
+            participant_overlap = participants.intersection(
+                self._existing_position_participants
+            )
+            if event_overlap or participant_overlap:
+                raise ValueError("existing combo positions are correlated with each other")
+            self._existing_position_events.update(events)
+            self._existing_position_participants.update(participants)
+            self.ledger.positions[ticker] = count
+            self._audit(
+                "rfq_existing_position_loaded",
+                {
+                    "ticker": ticker,
+                    "position_fp": str(count),
+                    "events": sorted(events),
+                    "participants": sorted(participants),
+                },
+            )
 
     async def prepare(self) -> None:
         tickers = await asyncio.to_thread(self.fair_book.refresh)
         selected = tuple(ticker for ticker in tickers if self._ticker_allowed(ticker))
         if not selected:
             raise ValueError("no allowed moneyline tickers have a fresh fair value")
+        now = datetime.now(UTC)
+        active_sports: dict[str, int] = {}
+        for ticker in selected:
+            fair = self.fair_book.get(ticker)
+            if fair is None or fair.event_start <= now:
+                continue
+            if self.config.max_hours_to_start is not None and (
+                fair.event_start - now
+            ).total_seconds() > float(self.config.max_hours_to_start) * 3600:
+                continue
+            active_sports[fair.sport] = active_sports.get(fair.sport, 0) + 1
+        missing = set(self.config.required_active_sports) - set(active_sports)
+        self._audit("rfq_lane_readiness", {"active_fairs_by_sport": active_sports})
+        if missing:
+            raise ValueError(
+                "required RFQ sports have no eligible fixtures: "
+                + ", ".join(sorted(missing))
+            )
         if self.execute:
             existing = await asyncio.to_thread(
                 self.client.get_rfq_quotes,
@@ -1415,6 +2139,12 @@ class RFQMaker:
         )
         available_cents = as_decimal(balance.get("balance", "0"))
         self.ledger.available_balance = available_cents / Decimal("100")
+        positions = await asyncio.to_thread(
+            self.client.get_positions,
+            subaccount=self.config.subaccount,
+            limit=1000,
+        )
+        await self._load_existing_position_exposure(positions)
         for offset in range(0, len(selected), PREPARE_MARKET_BATCH_SIZE):
             batch = selected[offset : offset + PREPARE_MARKET_BATCH_SIZE]
             await asyncio.gather(*(self._ensure_leg_market(ticker) for ticker in batch))
@@ -1429,6 +2159,35 @@ class RFQMaker:
                 "tickers": list(selected),
                 "event_tickers": {ticker: self.event_tickers[ticker] for ticker in selected},
                 "edge_rate": str(self.config.edge_rate),
+                "pricing_mode": self.config.pricing_mode,
+                "no_side_only": self.config.no_side_only,
+                "pinnacle_only": self.config.pinnacle_only,
+                "max_hours_to_start": (
+                    str(self.config.max_hours_to_start)
+                    if self.config.max_hours_to_start is not None
+                    else None
+                ),
+                "moneyline_yes_only": self.config.moneyline_yes_only,
+                "max_moneyline_fair": (
+                    str(self.config.max_moneyline_fair)
+                    if self.config.max_moneyline_fair is not None
+                    else None
+                ),
+                "fixed_margin": str(self.config.fixed_margin),
+                "minimum_cushion": str(self.config.minimum_cushion),
+                "two_leg_premium": str(self.config.two_leg_premium),
+                "player_prop_premium": str(self.config.player_prop_premium),
+                "soccer_premium": str(self.config.soccer_premium),
+                "per_leg_outcome_notional_cap": (
+                    str(self.config.per_leg_outcome_notional_cap)
+                    if self.config.per_leg_outcome_notional_cap is not None
+                    else None
+                ),
+                "per_combo_notional_cap": (
+                    str(self.config.per_combo_notional_cap)
+                    if self.config.per_combo_notional_cap is not None
+                    else None
+                ),
                 "maker_fee_rate": str(self.config.maker_fee_rate),
                 "maker_fee_multipliers": {
                     ticker: str(self.maker_fee_multipliers[ticker]) for ticker in selected
@@ -1439,7 +2198,28 @@ class RFQMaker:
                     if self.config.max_session_contracts is not None
                     else None
                 ),
+                "max_session_notional": (
+                    str(self.config.max_session_notional)
+                    if self.config.max_session_notional is not None
+                    else None
+                ),
                 "max_session_executions": self.config.max_session_executions,
+                "max_target_cost": (
+                    str(self.config.max_target_cost)
+                    if self.config.max_target_cost is not None
+                    else None
+                ),
+                "max_active_quotes": self.config.max_active_quotes,
+                "first_fill_wins": self.config.first_fill_wins,
+                "allow_existing_positions": self.config.allow_existing_positions,
+                "existing_position_events": sorted(self._existing_position_events),
+                "max_inflight_rfqs": self.config.max_inflight_rfqs,
+                "contracts_only": self.config.contracts_only,
+                "coverage_shadow": self.config.coverage_shadow,
+                "creator_rate_limit": self.config.creator_rate_limit,
+                "creator_burst_limit": self.config.creator_burst_limit,
+                "creator_burst_window_seconds": self.config.creator_burst_window_seconds,
+                "required_active_sports": list(self.config.required_active_sports),
                 "max_unaccepted_quote_age_seconds": (
                     self.config.max_unaccepted_quote_age_seconds
                 ),
@@ -1456,6 +2236,7 @@ class RFQMaker:
             if time.monotonic() - received_at > self.config.max_quote_latency_seconds:
                 raise ValueError("RFQ exceeded the maximum quote latency")
             request = RFQRequest.from_message(message)
+            request = await self._enforce_creator_rate(request)
             if request.is_combo:
                 await asyncio.gather(
                     *(self._ensure_leg_market(leg.market_ticker) for leg in request.legs)
@@ -1472,17 +2253,16 @@ class RFQMaker:
                     )
             fair, leg_fairs = self._request_fair(request)
             grid = await self._ensure_quote_market(request)
-            plan = price_moneyline_rfq(
+            plan = self._price_request(
                 request,
                 fair,
-                price_grid=grid,
-                edge_rate=self.config.edge_rate,
-                maker_fee_rate=self.config.maker_fee_rate,
-                maker_fee_multiplier=self.maker_fee_multipliers[request.ticker],
+                grid=grid,
+                fee_multiplier=self.maker_fee_multipliers[request.ticker],
                 leg_fairs=leg_fairs,
             )
             async with self._lock:
-                self._ensure_no_overlapping_reservation(request)
+                self._ensure_no_existing_position_overlap(plan)
+                self._ensure_no_overlapping_reservation(plan)
                 plan = self.ledger.constrain(plan)
                 if request.rfq_id in self.closed_rfqs:
                     raise ValueError("RFQ closed before quote submission")
@@ -1490,6 +2270,10 @@ class RFQMaker:
                     f"pending:{request.rfq_id}" if self.execute else f"dry-run:{request.rfq_id}"
                 )
                 self.ledger.reserve(plan, quote_id)
+                if self.config.coverage_shadow:
+                    self.ledger.reservations[
+                        request.rfq_id
+                    ].submitted_at_monotonic = time.monotonic()
                 reservation_created = True
             if self.execute:
                 if time.monotonic() - received_at > self.config.max_quote_latency_seconds:
@@ -1532,6 +2316,10 @@ class RFQMaker:
                 "rfq_quote_submitted" if self.execute else "rfq_quote_dry_run",
                 {**plan.as_dict(), "quote_id": quote_id, "latency_ms": round(elapsed_ms, 3)},
             )
+            coverage_outcome = "quote submitted" if self.execute else "quoteable dry run"
+            if self.config.coverage_shadow:
+                coverage_outcome = "quoteable shadow"
+            self._record_coverage(request.sizing_mode, coverage_outcome)
         except Exception as exc:
             if isinstance(exc, KalshiAPIError) and 400 <= exc.status_code < 500:
                 # A client-error response proves the exchange rejected the quote.
@@ -1540,6 +2328,10 @@ class RFQMaker:
             if reservation_created and not retain_reservation_on_error and request is not None:
                 async with self._lock:
                     self.ledger.release(request.rfq_id)
+            self._record_coverage(
+                request.sizing_mode if request is not None else "invalid",
+                "ambiguous quote submission" if retain_reservation_on_error else str(exc),
+            )
             if not retain_reservation_on_error and str(exc) in AGGREGATED_RFQ_SKIP_REASONS:
                 self._record_unsupported(str(exc))
                 return
@@ -1568,14 +2360,19 @@ class RFQMaker:
             side = str(payload.get("accepted_side", ""))
             if side not in {"yes", "no"}:
                 raise ValueError("accepted RFQ side is invalid")
+            if self.config.no_side_only and side != "no":
+                raise ValueError("YES-side acceptances are disabled")
             self._require_expected_subaccount(payload)
-            count = as_decimal(payload.get("contracts_accepted_fp", "0"))
+            count = self._accepted_contracts(payload, side)
+            offered_raw = payload.get(f"{side}_contracts_offered_fp")
+            if offered_raw not in {None, ""} and count != as_decimal(offered_raw):
+                raise ValueError("accepted RFQ size does not match Kalshi's offered size")
             if count <= ZERO or count > reservation.plan.contracts_for(side):
                 raise ValueError("accepted RFQ size exceeds the reserved quote")
             quoted_price = reservation.plan.yes_bid if side == "yes" else reservation.plan.no_bid
             if quoted_price <= ZERO:
                 raise ValueError("customer accepted a disabled RFQ side")
-            fair, _ = self._request_fair(reservation.plan.request)
+            fair, leg_fairs = self._request_fair(reservation.plan.request)
             outcome_fair = fair.probability if side == "yes" else ONE - fair.probability
             gross_edge_rate, estimated_fee, current_edge_rate = modeled_rfq_edge(
                 outcome_fair,
@@ -1584,7 +2381,22 @@ class RFQMaker:
                 fee_rate=reservation.plan.maker_fee_rate,
                 fee_multiplier=reservation.plan.maker_fee_multiplier,
             )
-            if current_edge_rate < self.config.edge_rate:
+            if self.config.pricing_mode == "lead_fixed":
+                current_plan = self._price_request(
+                    reservation.plan.request,
+                    fair,
+                    grid=self.price_grids[reservation.plan.request.ticker],
+                    fee_multiplier=reservation.plan.maker_fee_multiplier,
+                    leg_fairs=leg_fairs,
+                )
+                safe_price = (
+                    current_plan.yes_bid if side == "yes" else current_plan.no_bid
+                )
+                if safe_price <= ZERO or quoted_price > safe_price:
+                    raise ValueError(
+                        "fair value moved through the lead-style margin before confirmation"
+                    )
+            elif current_edge_rate < self.config.edge_rate:
                 raise ValueError(
                     "fair value moved through the minimum proportional edge net of fees "
                     "before confirmation"
@@ -1595,8 +2407,51 @@ class RFQMaker:
             # rfq_deleted while the accepted trade is still in its execution timer;
             # the reservation must survive until quote_executed in that case.
             async with self._lock:
-                reservation.accepted_side = side
-                reservation.accepted_contracts = count
+                self.ledger.mark_acceptance(
+                    reservation,
+                    side=side,
+                    contracts=count,
+                )
+            quote_age_seconds = (
+                time.monotonic() - reservation.submitted_at_monotonic
+                if reservation.submitted_at_monotonic is not None
+                else None
+            )
+            self._audit(
+                "rfq_quote_accepted",
+                {
+                    "rfq_id": rfq_id,
+                    "quote_id": quote_id,
+                    "ticker": reservation.plan.request.ticker,
+                    "accepted_side": side,
+                    "contracts_fp": str(count),
+                    "quote_age_seconds": (
+                        round(quote_age_seconds, 3)
+                        if quote_age_seconds is not None
+                        else None
+                    ),
+                    "leg_count": len(reservation.plan.request.legs),
+                    "sizing_mode": reservation.plan.request.sizing_mode,
+                    "target_cost_dollars": (
+                        str(reservation.plan.request.target_cost)
+                        if reservation.plan.request.target_cost is not None
+                        else None
+                    ),
+                    "quoted_price": str(quoted_price),
+                    "quote_time_net_edge_rate": str(
+                        reservation.plan.yes_edge_rate
+                        if side == "yes"
+                        else reservation.plan.no_edge_rate
+                    ),
+                    "current_net_edge_rate": str(current_edge_rate),
+                },
+            )
+            if self.config.first_fill_wins:
+                cancel_task = asyncio.create_task(
+                    self._cancel_competing_quotes(winner_rfq_id=rfq_id)
+                )
+                self._tasks.add(cancel_task)
+                cancel_task.add_done_callback(self._tasks.discard)
             await asyncio.to_thread(self.client.confirm_rfq_quote, rfq_id, quote_id)
             async with self._lock:
                 reservation.confirmed_outcome_fair = outcome_fair
@@ -1630,6 +2485,58 @@ class RFQMaker:
                 "latency_ms": round(elapsed_ms, 3),
             },
         )
+
+    async def _cancel_competing_quotes(self, *, winner_rfq_id: str) -> None:
+        async with self._lock:
+            candidates = tuple(
+                (rfq_id, reservation)
+                for rfq_id, reservation in self.ledger.reservations.items()
+                if rfq_id != winner_rfq_id
+                and reservation.accepted_side is None
+                and not reservation.quote_id.startswith("pending:")
+            )
+        results = await asyncio.gather(
+            *(
+                asyncio.to_thread(
+                    self.client.delete_rfq_quote,
+                    rfq_id,
+                    reservation.quote_id,
+                )
+                for rfq_id, reservation in candidates
+            ),
+            return_exceptions=True,
+        )
+        for (rfq_id, reservation), result in zip(candidates, results, strict=True):
+            reconciled_absent = False
+            if isinstance(result, KalshiAPIError) and result.status_code == 404:
+                reconciled_absent = await self._ttl_quote_is_absent(rfq_id, reservation)
+                if reconciled_absent:
+                    result = None
+            if isinstance(result, BaseException):
+                self._audit(
+                    "rfq_competing_quote_cancel_failed",
+                    {
+                        "rfq_id": rfq_id,
+                        "quote_id": reservation.quote_id,
+                        "winner_rfq_id": winner_rfq_id,
+                        "reason": str(result),
+                        "risk_reserved": True,
+                    },
+                )
+                continue
+            async with self._lock:
+                current = self.ledger.reservations.get(rfq_id)
+                if current is reservation and reservation.accepted_side is None:
+                    self.ledger.release(rfq_id)
+            self._audit(
+                "rfq_competing_quote_cancelled",
+                {
+                    "rfq_id": rfq_id,
+                    "quote_id": reservation.quote_id,
+                    "winner_rfq_id": winner_rfq_id,
+                    "reconciled_absent": reconciled_absent,
+                },
+            )
 
     async def _deleted(self, message: dict[str, Any]) -> None:
         payload = message.get("msg")
@@ -1762,11 +2669,14 @@ class RFQMaker:
                 accepted_side = str(quote.get("accepted_side", "")).casefold()
                 if accepted_side in {"yes", "no"} and reservation.accepted_side is None:
                     reservation.accepted_side = accepted_side
-                    reservation.accepted_contracts = as_decimal(
-                        quote.get("contracts_fp")
-                        or quote.get(f"{accepted_side}_contracts_fp")
-                        or reservation.plan.contracts_for(accepted_side)
+                    reservation.accepted_contracts = self._accepted_contracts(
+                        quote,
+                        accepted_side,
                     )
+                    if reservation.accepted_contracts <= ZERO:
+                        reservation.accepted_contracts = reservation.plan.contracts_for(
+                            accepted_side
+                        )
                 terminal = bool(quote.get("executed_ts") or quote.get("cancelled_ts")) or (
                     status in {"executed", "cancelled", "expired", "closed"}
                 )
@@ -1828,7 +2738,7 @@ class RFQMaker:
 
     async def _expire_unaccepted_once(self, *, now: float | None = None) -> None:
         ttl = self.config.max_unaccepted_quote_age_seconds
-        if not self.execute or ttl is None:
+        if (not self.execute and not self.config.coverage_shadow) or ttl is None:
             return
         now = time.monotonic() if now is None else now
         async with self._lock:
@@ -1853,6 +2763,21 @@ class RFQMaker:
                 ):
                     continue
             age = now - reservation.submitted_at_monotonic
+            if self.config.coverage_shadow:
+                async with self._lock:
+                    current = self.ledger.reservations.get(rfq_id)
+                    if current is reservation:
+                        self.ledger.release(rfq_id)
+                self._audit(
+                    "rfq_shadow_ttl_released",
+                    {
+                        "rfq_id": rfq_id,
+                        "quote_id": reservation.quote_id,
+                        "age_seconds": round(age, 3),
+                        "reason": "simulated unaccepted quote reached the configured lifetime",
+                    },
+                )
+                continue
             try:
                 await asyncio.to_thread(
                     self.client.delete_rfq_quote,
@@ -1986,6 +2911,20 @@ class RFQMaker:
 
     async def shutdown(self) -> None:
         if not self.execute:
+            if self.config.coverage_shadow:
+                async with self._lock:
+                    reservations = tuple(self.ledger.reservations.items())
+                    for rfq_id, _ in reservations:
+                        self.ledger.release(rfq_id)
+                for rfq_id, reservation in reservations:
+                    self._audit(
+                        "rfq_shadow_shutdown_released",
+                        {
+                            "rfq_id": rfq_id,
+                            "quote_id": reservation.quote_id,
+                            "reason": "coverage shadow stopped with a simulated quote active",
+                        },
+                    )
             return
         async with self._lock:
             reservations = tuple(self.ledger.reservations.items())
@@ -2059,14 +2998,16 @@ class RFQMaker:
             rfq_id = str(payload.get("rfq_id") or payload.get("id") or f"unkeyed:{seen}")
             seen += 1
             if message_type == "rfq_created":
-                rejection = self._prefilter_created(message)
+                rejection, sizing_mode = self._prefilter_created(message)
                 if rejection is not None:
                     self._record_unsupported(rejection)
+                    self._record_coverage(sizing_mode, rejection)
                     if max_messages and seen >= max_messages:
                         return
                     continue
                 if len(self._tasks) >= self.config.max_inflight_rfqs:
                     self._record_unsupported("RFQ handler capacity reached")
+                    self._record_coverage(sizing_mode, "RFQ handler capacity reached")
                     if max_messages and seen >= max_messages:
                         return
                     continue
@@ -2106,15 +3047,37 @@ class RFQMaker:
         reconcile_task = asyncio.create_task(self._reconcile_quotes()) if self.execute else None
         expiry_task = (
             asyncio.create_task(self._expire_unaccepted_quotes())
-            if self.execute and self.config.max_unaccepted_quote_age_seconds is not None
+            if (self.execute or self.config.coverage_shadow)
+            and self.config.max_unaccepted_quote_age_seconds is not None
             else None
         )
         try:
             if seconds > 0:
-                with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(
-                        self._consume(max_messages=max_messages), timeout=seconds
-                    )
+                # datetime.now(UTC) advances across host sleep on platforms where
+                # the event-loop monotonic clock may pause. This keeps a real-money
+                # canary inside its authorized wall-clock window.
+                deadline_utc = datetime.now(UTC).timestamp() + seconds
+
+                async def absolute_deadline() -> None:
+                    while True:
+                        remaining = deadline_utc - datetime.now(UTC).timestamp()
+                        if remaining <= 0:
+                            return
+                        await asyncio.sleep(min(1.0, remaining))
+
+                consume_task = asyncio.create_task(
+                    self._consume(max_messages=max_messages)
+                )
+                deadline_task = asyncio.create_task(absolute_deadline())
+                done, _ = await asyncio.wait(
+                    {consume_task, deadline_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if deadline_task in done:
+                    consume_task.cancel()
+                else:
+                    deadline_task.cancel()
+                await asyncio.gather(consume_task, deadline_task, return_exceptions=True)
             else:
                 await self._consume(max_messages=max_messages)
         finally:
@@ -2134,4 +3097,5 @@ class RFQMaker:
             if self._tasks:
                 await asyncio.gather(*self._tasks, return_exceptions=True)
             self._flush_unsupported_summary()
+            self._flush_coverage_summary()
             await self.shutdown()

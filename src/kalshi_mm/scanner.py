@@ -74,6 +74,11 @@ _FULL_GAME_TOTAL_PATTERN = re.compile(
     r"^(?:reg(?:ulation)?\s+time:\s*)?over\s+(\d+(?:\.\d+)?)\b",
     re.IGNORECASE,
 )
+_FULL_GAME_SPREAD_PATTERN = re.compile(
+    r"^(?P<team>.+?)\s+wins(?:\s+the\s+game)?\s+by\s+over\s+"
+    r"(?P<line>\d+(?:\.\d+)?)\s+(?:runs?|points?)\b",
+    re.IGNORECASE,
+)
 _PARTIAL_GAME_PATTERN = re.compile(
     r"\b(?:1h|2h|first\s+half|1st\s+half|second\s+half|2nd\s+half|"
     r"first\s+(?:five|5)|1st\s+5|first\s+inning|1st\s+inning|"
@@ -94,6 +99,13 @@ def parse_full_game_total_line(
         return None
     matched = _FULL_GAME_TOTAL_PATTERN.match(outcome.strip())
     return as_decimal(matched.group(1)) if matched else None
+
+
+def parse_full_game_spread(outcome: str) -> tuple[str, Decimal] | None:
+    matched = _FULL_GAME_SPREAD_PATTERN.match(outcome.strip())
+    if matched is None:
+        return None
+    return matched.group("team").strip(), as_decimal(matched.group("line"))
 
 
 def _market_for(bookmaker: BookmakerOdds, market_key: str) -> OddsMarket | None:
@@ -263,6 +275,59 @@ def consensus_total_probability(
     )
 
 
+def consensus_spread_probability(
+    event: OddsEvent,
+    team: str,
+    margin: Decimal,
+    *,
+    min_bookmakers: int = 2,
+    max_age_seconds: float = 180,
+    now: datetime | None = None,
+) -> ConsensusPrice | None:
+    """Build a no-vig team-cover probability for one exact full-game spread."""
+    now = now or datetime.now(UTC)
+    margin = as_decimal(margin)
+    probabilities: list[tuple[str, Decimal]] = []
+    for bookmaker in event.bookmakers:
+        market = _market_for(bookmaker, "spreads")
+        if market is None:
+            continue
+        last_update = market.last_update or bookmaker.last_update
+        if last_update and (now - last_update).total_seconds() > max_age_seconds:
+            continue
+        valid = [item for item in market.outcomes if item.price > 1 and item.point is not None]
+        matched = best_outcome_match(team, (item.name for item in valid))
+        if matched is None:
+            continue
+        target_name, _ = matched
+        target = next(
+            (
+                item
+                for item in valid
+                if item.name == target_name and item.point == -margin
+            ),
+            None,
+        )
+        if target is None:
+            continue
+        exact_line = [item for item in valid if abs(item.point or Decimal("0")) == margin]
+        if len(exact_line) != 2:
+            continue
+        inverse_sum = sum((Decimal("1") / item.price for item in exact_line), Decimal("0"))
+        fair = (Decimal("1") / target.price) / inverse_sum
+        probabilities.append((bookmaker.key, fair))
+    if len(probabilities) < min_bookmakers:
+        return None
+    values = [value for _, value in probabilities]
+    return ConsensusPrice(
+        fair_probability=median(values),
+        bookmaker_count=len(values),
+        minimum=min(values),
+        maximum=max(values),
+        bookmaker_keys=tuple(key for key, _ in probabilities),
+    )
+
+
 def _priced_discrepancy(
     kalshi: KalshiClient,
     match: EventMatch,
@@ -288,15 +353,24 @@ def _priced_discrepancy(
         ask_route=f"{ticker}:YES",
     )
     buy_edge = consensus.fair_probability - effective_book.ask
+    passive_bid_edge = consensus.fair_probability - effective_book.bid
     sell_edge = effective_book.bid - consensus.fair_probability
-    if buy_edge >= sell_edge:
-        action = "BUY YES" if buy_edge >= min_edge else "NONE"
+    if buy_edge >= min_edge:
+        action = "BUY YES"
         edge = buy_edge
-        action_route = effective_book.ask_route if action != "NONE" else None
-    else:
-        action = "SELL YES" if sell_edge >= min_edge else "NONE"
+        action_route = effective_book.ask_route
+    elif passive_bid_edge >= min_edge:
+        action = "MAKE BID"
+        edge = passive_bid_edge
+        action_route = effective_book.bid_route
+    elif sell_edge >= min_edge:
+        action = "SELL YES"
         edge = sell_edge
-        action_route = effective_book.bid_route if action != "NONE" else None
+        action_route = effective_book.bid_route
+    else:
+        action = "NONE"
+        edge = max(buy_edge, passive_bid_edge, sell_edge)
+        action_route = None
     return Discrepancy(
         ticker=ticker,
         event_ticker=str(match.kalshi_event.get("event_ticker", "")),

@@ -66,7 +66,7 @@ class PaperRecorder:
             for horizon in self.markout_horizons_seconds:
                 if horizon in signal.marked_horizons or age_seconds < horizon:
                     continue
-                if signal.action == "BUY YES":
+                if signal.action in {"BUY YES", "MAKE BID"}:
                     markout = snapshot.midpoint - signal.entry_price
                 else:
                     markout = signal.entry_price - snapshot.midpoint

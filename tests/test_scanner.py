@@ -288,6 +288,23 @@ def test_scanner_compares_fair_to_executable_bid_and_ask() -> None:
     assert new_york.yes_ask == Decimal("0.50")
 
 
+def test_scanner_flags_passive_bid_when_bid_is_below_fair() -> None:
+    results = scan_moneyline_discrepancies(
+        kalshi=FakeKalshi(),  # type: ignore[arg-type]
+        odds=FakeOdds(),  # type: ignore[arg-type]
+        series_ticker="KXMLBGAME",
+        sport="baseball_mlb",
+        min_edge=Decimal("0.01"),
+        include_live=True,
+        now=datetime(2026, 7, 4, 20, tzinfo=UTC),
+    )
+
+    new_york = next(item for item in results if item.outcome == "New York M")
+    assert new_york.action == "MAKE BID"
+    assert new_york.edge > Decimal("0.01")
+    assert new_york.action_route == "KXMLBGAME-TEST-NYM:YES|KXMLBGAME-TEST-TOR:NO"
+
+
 def test_scanner_merges_other_outcomes_no_book() -> None:
     results = scan_moneyline_discrepancies(
         kalshi=FakeSyntheticKalshi(),  # type: ignore[arg-type]

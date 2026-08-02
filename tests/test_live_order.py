@@ -216,7 +216,7 @@ def test_preflight_rejects_crossing_and_insufficient_edge() -> None:
         side="bid",
         price=Decimal("0.16"),
         count=Decimal("1"),
-        fair_probability=Decimal("0.17"),
+        fair_probability=Decimal("0.169"),
         external_start_time=now + timedelta(hours=1),
         expiration_seconds=120,
     )
@@ -225,6 +225,29 @@ def test_preflight_rejects_crossing_and_insufficient_edge() -> None:
         preflight_live_order(client, crossing, LiveRiskLimits(), authenticated=False, now=now)
     with pytest.raises(ValueError, match="below the live minimum"):
         preflight_live_order(client, low_edge, LiveRiskLimits(), authenticated=False, now=now)
+
+
+def test_preflight_allows_one_cent_passive_bid_edge() -> None:
+    now = datetime(2026, 7, 11, 2, tzinfo=UTC)
+    one_cent_edge = LiveOrderRequest(
+        ticker="MARKET",
+        side="bid",
+        price=Decimal("0.16"),
+        count=Decimal("1"),
+        fair_probability=Decimal("0.17"),
+        external_start_time=now + timedelta(hours=1),
+        expiration_seconds=120,
+    )
+
+    result = preflight_live_order(
+        FakeLiveClient(now),
+        one_cent_edge,
+        LiveRiskLimits(),
+        authenticated=False,
+        now=now,
+    )
+
+    assert result.modeled_edge == Decimal("0.01")
 
 
 def test_reduce_only_ask_can_exit_without_positive_edge() -> None:

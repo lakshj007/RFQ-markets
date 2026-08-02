@@ -24,7 +24,8 @@ BOUNDED_EXIT_ACKNOWLEDGEMENT = "BOUNDED_REDUCE_ONLY_EXIT"
 MONITORED_ENTRY_ACKNOWLEDGEMENT = "MONITOR_ODDS_AND_CANCEL_ENTRY"
 HARD_MAX_CONTRACTS = Decimal("1")
 HARD_MAX_ORDER_COST = Decimal("1")
-HARD_MIN_EDGE = Decimal("0.02")
+HARD_MIN_EDGE = Decimal("0.01")
+HARD_MIN_ADVERSE_MOVE = Decimal("0.02")
 HARD_MAX_SPREAD = Decimal("0.15")
 HARD_MAX_QUEUE_AHEAD = Decimal("500")
 HARD_MAX_TRADE_AGE_SECONDS = 900
@@ -133,7 +134,7 @@ class LiveRiskLimits:
             max_contracts=_env_decimal("KALSHI_LIVE_MAX_CONTRACTS", "1"),
             max_order_cost=_env_decimal("KALSHI_LIVE_MAX_ORDER_COST", "1"),
             max_abs_position=_env_decimal("KALSHI_LIVE_MAX_ABS_POSITION", "1"),
-            min_edge=_env_decimal("KALSHI_LIVE_MIN_EDGE", "0.02"),
+            min_edge=_env_decimal("KALSHI_LIVE_MIN_EDGE", "0.01"),
             max_spread=_env_decimal("KALSHI_LIVE_MAX_SPREAD", "0.15"),
             max_queue_ahead=_env_decimal("KALSHI_LIVE_MAX_QUEUE_AHEAD", "500"),
             max_trade_age_seconds=_env_int(
@@ -155,7 +156,7 @@ class LiveRiskLimits:
         if not ZERO < self.max_abs_position <= HARD_MAX_CONTRACTS:
             raise ValueError("live max absolute position must be in (0, 1]")
         if self.min_edge < HARD_MIN_EDGE:
-            raise ValueError("live minimum edge cannot be below $0.02")
+            raise ValueError("live minimum edge cannot be below $0.01")
         if not ZERO < self.max_spread <= HARD_MAX_SPREAD:
             raise ValueError("live maximum spread must be in (0, $0.15]")
         if not ZERO < self.max_queue_ahead <= HARD_MAX_QUEUE_AHEAD:
@@ -229,7 +230,7 @@ class MonitoredEntryConfig:
     max_odds_age_seconds: float = 60
     failure_grace_seconds: float = 15
     rest_reconcile_seconds: float = 10
-    adverse_move: Decimal = HARD_MIN_EDGE
+    adverse_move: Decimal = HARD_MIN_ADVERSE_MOVE
 
     def validate(self) -> None:
         if not 0.01 <= self.poll_interval_seconds <= 60:
@@ -242,7 +243,7 @@ class MonitoredEntryConfig:
             raise ValueError("monitored failure grace must be between 0.01 and 60 seconds")
         if not 0.01 <= self.rest_reconcile_seconds <= 30:
             raise ValueError("REST reconciliation must be between 0.01 and 30 seconds")
-        if not HARD_MIN_EDGE <= self.adverse_move <= Decimal("0.10"):
+        if not HARD_MIN_ADVERSE_MOVE <= self.adverse_move <= Decimal("0.10"):
             raise ValueError("adverse Kalshi move must be between $0.02 and $0.10")
 
 
@@ -251,7 +252,7 @@ class FairAwareExitConfig:
     fair_poll_seconds: float = 30
     rest_reconcile_seconds: float = 10
     failure_grace_seconds: float = 15
-    adverse_move: Decimal = HARD_MIN_EDGE
+    adverse_move: Decimal = HARD_MIN_ADVERSE_MOVE
 
     def validate(self) -> None:
         if not 0.01 <= self.fair_poll_seconds <= 60:
@@ -260,7 +261,7 @@ class FairAwareExitConfig:
             raise ValueError("exit REST reconciliation must be between 0.01 and 30 seconds")
         if not 0.01 <= self.failure_grace_seconds <= 60:
             raise ValueError("exit failure grace must be between 0.01 and 60 seconds")
-        if not HARD_MIN_EDGE <= self.adverse_move <= Decimal("0.10"):
+        if not HARD_MIN_ADVERSE_MOVE <= self.adverse_move <= Decimal("0.10"):
             raise ValueError("exit adverse move must be between $0.02 and $0.10")
 
 

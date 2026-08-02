@@ -49,6 +49,7 @@ from .rfq import (
     KALSHI_MAKER_FEE_RATE,
     RFQ_LIVE_ACKNOWLEDGEMENT,
     RFQ_LIVE_ENABLE_TOKEN,
+    CompositeMoneylineFairBook,
     JsonMoneylineFairBook,
     MarkdownRFQFillLedger,
     OddsMoneylineFairBook,
@@ -72,6 +73,19 @@ def _moneyline(value: str) -> int:
     if odds == 0:
         raise argparse.ArgumentTypeError("moneyline cannot be zero")
     return odds
+
+
+def _odds_lane(value: str) -> tuple[str, str, str]:
+    parts = tuple(part.strip() for part in value.split(":"))
+    if len(parts) != 3 or any(not part for part in parts):
+        raise argparse.ArgumentTypeError(
+            "odds lane must be SERIES:SPORT:MARKET, for example "
+            "KXMLBGAME:baseball_mlb:h2h"
+        )
+    series, sport, market = parts
+    if market not in {"h2h", "totals", "spreads"}:
+        raise argparse.ArgumentTypeError("odds lane market must be h2h, totals, or spreads")
+    return series, sport, market
 
 
 def _client(*, demo: bool = False) -> KalshiClient:
@@ -1047,6 +1061,9 @@ class _RFQAudit:
             "rfq_quote_executed",
             "rfq_quote_ambiguous",
             "rfq_quote_skipped",
+            "rfq_shadow_ttl_released",
+            "rfq_shadow_shutdown_released",
+            "rfq_coverage_summary",
             "rfq_unsupported_summary",
             "rfq_confirmation_withheld",
         }:
@@ -1055,6 +1072,8 @@ class _RFQAudit:
             detail = (
                 f"{payload.get('messages', 0)} unsupported: {payload.get('reasons', {})}"
                 if event == "rfq_unsupported_summary"
+                else f"{payload.get('messages', 0)} RFQs: {payload.get('sizing', {})}"
+                if event == "rfq_coverage_summary"
                 else payload.get("reason")
                 or f"YES {payload.get('yes_bid', '-')} / NO {payload.get('no_bid', '-')}"
             )
@@ -1064,25 +1083,62 @@ class _RFQAudit:
 RFQ_CANARY_COLLECTION = "KXMVESPORTSMULTIGAMEEXTENDED-R"
 RFQ_CANARY_SERIES = "KXMLBGAME"
 RFQ_CANARY_SPORT = "baseball_mlb"
+LEAD_STYLE_ODDS_LANES = {
+    ("KXMLBGAME", "baseball_mlb", "h2h"),
+    ("KXMLBTOTAL", "baseball_mlb", "totals"),
+    ("KXMLBSPREAD", "baseball_mlb", "spreads"),
+    ("KXWNBAGAME", "basketball_wnba", "h2h"),
+    ("KXWNBATOTAL", "basketball_wnba", "totals"),
+    ("KXWNBASPREAD", "basketball_wnba", "spreads"),
+    ("KXMLSGAME", "soccer_usa_mls", "h2h"),
+    ("KXMLSTOTAL", "soccer_usa_mls", "totals"),
+    ("KXLIGAMXGAME", "soccer_mexico_ligamx", "h2h"),
+    ("KXLIGAMXTOTAL", "soccer_mexico_ligamx", "totals"),
+}
 
 
 def _validate_rfq_live_canary(args: argparse.Namespace) -> None:
     if not args.canary_live:
         raise ValueError("production RFQ execution requires --canary-live")
-    if args.fair_file is not None or args.series != RFQ_CANARY_SERIES:
-        raise ValueError(f"live canary requires Odds API fair values from {RFQ_CANARY_SERIES}")
-    if args.odds_sport != RFQ_CANARY_SPORT:
-        raise ValueError(f"live canary requires --odds-sport {RFQ_CANARY_SPORT}")
+    if args.fair_file is not None:
+        raise ValueError("live canary requires direct Odds API fair values")
+    if args.odds_lane:
+        if not args.lead_style_profile:
+            raise ValueError("multi-lane live canary requires --lead-style-profile")
+        if args.series is not None or args.odds_sport is not None:
+            raise ValueError("multi-lane live canary cannot also use --series/--odds-sport")
+        unsupported = set(args.odds_lane) - LEAD_STYLE_ODDS_LANES
+        if unsupported:
+            raise ValueError("live canary contains an unsupported odds lane")
+    else:
+        if args.series != RFQ_CANARY_SERIES:
+            raise ValueError(
+                f"live canary requires Odds API fair values from {RFQ_CANARY_SERIES}"
+            )
+        if args.odds_sport != RFQ_CANARY_SPORT:
+            raise ValueError(f"live canary requires --odds-sport {RFQ_CANARY_SPORT}")
+        if args.odds_market_type != "h2h":
+            raise ValueError("single-lane live canary requires --odds-market-type h2h")
     if set(args.allow_collection) != {RFQ_CANARY_COLLECTION} or args.allow_ticker:
         raise ValueError(
             f"live canary must allow only collection {RFQ_CANARY_COLLECTION}"
         )
     if not args.combo_only or args.allow_live:
         raise ValueError("live canary requires --combo-only and forbids --allow-live")
-    if not args.contracts_only:
-        raise ValueError("live canary requires --contracts-only")
-    if args.edge_percent < Decimal("1"):
-        raise ValueError("live canary requires at least 1% net modeled edge")
+    if not args.contracts_only and not args.allow_target_cost:
+        raise ValueError(
+            "live canary requires an explicit sizing mode: --contracts-only or "
+            "--allow-target-cost"
+        )
+    if args.contracts_only and args.max_target_cost is not None:
+        raise ValueError("contracts-only live canary cannot configure --max-target-cost")
+    if args.allow_target_cost and (
+        args.max_target_cost is None
+        or not ZERO < args.max_target_cost <= Decimal("5")
+    ):
+        raise ValueError("target-cost live canary requires --max-target-cost in (0, $5]")
+    if args.edge_percent < Decimal("0.75"):
+        raise ValueError("live canary requires at least 0.75% net modeled edge")
     minimum_fee_percent = KALSHI_MAKER_FEE_RATE * Decimal("100")
     if args.maker_fee_rate_percent < minimum_fee_percent:
         raise ValueError(f"live canary maker-fee rate must be at least {minimum_fee_percent}%")
@@ -1098,18 +1154,28 @@ def _validate_rfq_live_canary(args: argparse.Namespace) -> None:
         raise ValueError("live canary requires subaccount 0 or a numbered subaccount 1-32")
     if not ZERO < args.min_contracts <= args.max_contracts <= Decimal("10"):
         raise ValueError("live canary contract limits must be positive and capped at 10")
-    if args.max_position > Decimal("10") or args.max_notional > Decimal("10"):
-        raise ValueError("live canary position and notional limits must be capped at 10")
-    if args.max_session_contracts != Decimal("10"):
-        raise ValueError("live canary requires a ten-contract session-wide execution cap")
-    if args.max_session_executions != 1:
-        raise ValueError("live canary requires a one-execution session-wide cap")
-    if args.max_active_quotes != 1 or args.max_inflight_rfqs != 1:
-        raise ValueError("live canary requires one active quote and one in-flight handler")
+    if args.max_position > Decimal("10") or args.max_notional > Decimal("5"):
+        raise ValueError("live canary position must be capped at 10 and each fill at $5")
+    if args.max_session_notional is None or not (
+        ZERO < args.max_session_notional <= Decimal("20")
+    ):
+        raise ValueError("live canary requires a session-wide notional cap in (0, $20]")
+    if args.max_session_contracts != Decimal("40"):
+        raise ValueError("live canary requires a forty-contract session-wide execution cap")
+    if args.max_session_executions != 4:
+        raise ValueError("live canary requires a four-execution session-wide cap")
+    if args.first_fill_wins:
+        raise ValueError("four-fill live canary cannot use first-fill-wins")
+    quote_cap = 20 if args.first_fill_wins else 4
+    if not 1 <= args.max_active_quotes <= quote_cap or not 1 <= args.max_inflight_rfqs <= 20:
+        raise ValueError(
+            "live canary allows up to 20 in-flight handlers and up to 20 active quotes "
+            "only with --first-fill-wins (otherwise four)"
+        )
     if args.max_unaccepted_quote_age != 60:
         raise ValueError("live canary requires a 60-second unaccepted-quote lifetime")
-    if args.min_legs < 2 or args.max_legs > 6:
-        raise ValueError("live canary allows only 2-6 independent moneyline legs")
+    if args.min_legs < 2 or args.max_legs > 10:
+        raise ValueError("live canary allows only 2-10 independent supported legs")
     if (
         not math.isfinite(args.max_fair_age)
         or not math.isfinite(args.max_quote_latency)
@@ -1148,13 +1214,24 @@ def _preflight_rfq_live_canary(client: KalshiClient, args: argparse.Namespace) -
         raise ValueError("live canary numbered subaccount must contain no more than $10.00")
     if client.get_orders(status="resting", subaccount=args.subaccount, limit=1000):
         raise ValueError("live canary subaccount already has resting orders")
-    if client.get_positions(subaccount=args.subaccount, limit=1000):
+    if (
+        client.get_positions(subaccount=args.subaccount, limit=1000)
+        and not args.continue_open_independent_positions
+    ):
         raise ValueError("live canary subaccount already has positions")
 
 
 def _rfq_client(args: argparse.Namespace) -> tuple[KalshiClient, bool, bool]:
     if args.execute_demo and args.execute_live:
         raise ValueError("choose at most one of --execute-demo and --execute-live")
+    if args.allow_target_cost and args.max_target_cost is None:
+        raise ValueError("--allow-target-cost requires --max-target-cost")
+    if args.coverage_shadow and (args.execute_demo or args.execute_live):
+        raise ValueError("--coverage-shadow cannot be combined with RFQ execution")
+    if args.coverage_shadow and not args.allow_target_cost:
+        raise ValueError("--coverage-shadow requires explicit --allow-target-cost")
+    if args.coverage_shadow and args.max_unaccepted_quote_age is None:
+        raise ValueError("--coverage-shadow requires --max-unaccepted-quote-age")
     if args.execute_demo:
         if args.acknowledge_risk != "DEMO_ONLY":
             raise ValueError("--execute-demo requires --acknowledge-risk DEMO_ONLY")
@@ -1188,9 +1265,34 @@ def _cmd_rfq_maker(args: argparse.Namespace) -> None:
     client, demo, execute = _rfq_client(args)
     if not client.has_credentials:
         raise ValueError("RFQ WebSocket access requires Kalshi API credentials")
-    fair_choices = sum((args.fair_file is not None, args.odds_sport is not None))
+    if args.odds_lane and (args.series is not None or args.odds_sport is not None):
+        raise ValueError("--odds-lane cannot be combined with --series or --odds-sport")
+    fair_choices = sum(
+        (args.fair_file is not None, args.odds_sport is not None, bool(args.odds_lane))
+    )
     if fair_choices != 1:
-        raise ValueError("choose exactly one RFQ fair source: --fair-file or --odds-sport")
+        raise ValueError(
+            "choose exactly one RFQ fair source: --fair-file, --odds-sport, or --odds-lane"
+        )
+    if args.lead_style_profile:
+        if args.fair_file is not None:
+            raise ValueError("lead-style profile requires direct Pinnacle odds, not a fair file")
+        args.odds_bookmakers = "pinnacle"
+        args.odds_min_bookmakers = 1
+        args.odds_max_age = min(args.odds_max_age, 300)
+        args.max_fair_age = min(args.max_fair_age, 300)
+        args.odds_refresh = min(args.odds_refresh, 120)
+        configured_lanes = set(
+            args.odds_lane
+            or [(args.series, args.odds_sport, args.odds_market_type)]
+        )
+        unsupported_lanes = configured_lanes - LEAD_STYLE_ODDS_LANES
+        if unsupported_lanes:
+            formatted = ", ".join(":".join(lane) for lane in sorted(unsupported_lanes))
+            raise ValueError(
+                "lead-style profile refuses unsupported or not-yet-safe odds lanes: "
+                + formatted
+            )
     if args.fair_file is not None:
         fair_book = JsonMoneylineFairBook(
             args.fair_file,
@@ -1199,20 +1301,33 @@ def _cmd_rfq_maker(args: argparse.Namespace) -> None:
     else:
         if demo:
             raise ValueError("Odds API moneylines cannot safely map to Kalshi demo markets")
-        if not args.series:
+        odds_client = OddsClient.from_env()
+        lanes = args.odds_lane or [
+            (args.series, args.odds_sport, args.odds_market_type)
+        ]
+        if not args.odds_lane and not args.series:
             raise ValueError("--odds-sport requires --series")
-        fair_book = OddsMoneylineFairBook(
-            kalshi=client,
-            odds=OddsClient.from_env(),
-            series_ticker=args.series,
-            sport=args.odds_sport,
-            regions=args.odds_regions,
-            bookmakers=args.odds_bookmakers,
-            min_bookmakers=max(2, args.odds_min_bookmakers),
-            max_source_age_seconds=args.odds_max_age,
-            match_window_hours=args.odds_match_window_hours,
-            refresh_seconds=args.odds_refresh,
+        books = tuple(
+            OddsMoneylineFairBook(
+                kalshi=client,
+                odds=odds_client,
+                series_ticker=series,
+                sport=sport,
+                regions=args.odds_regions,
+                bookmakers=args.odds_bookmakers,
+                min_bookmakers=max(1, args.odds_min_bookmakers),
+                max_source_age_seconds=args.odds_max_age,
+                match_window_hours=args.odds_match_window_hours,
+                refresh_seconds=args.odds_refresh,
+                market_type=market,
+                allow_three_way=sport in {
+                    "soccer_usa_mls",
+                    "soccer_mexico_ligamx",
+                },
+            )
+            for series, sport, market in lanes
         )
+        fair_book = books[0] if len(books) == 1 else CompositeMoneylineFairBook(books)
     maker = RFQMaker(
         client=client,
         stream=KalshiRFQWebSocket(
@@ -1227,11 +1342,15 @@ def _cmd_rfq_maker(args: argparse.Namespace) -> None:
             maker_fee_rate=args.maker_fee_rate_percent / Decimal("100"),
             min_contracts=args.min_contracts,
             max_contracts=args.max_contracts,
+            max_target_cost=args.max_target_cost,
             max_abs_position=args.max_position,
             max_notional=args.max_notional,
+            max_session_notional=args.max_session_notional,
             max_session_contracts=args.max_session_contracts,
             max_session_executions=args.max_session_executions,
             max_active_quotes=args.max_active_quotes,
+            first_fill_wins=args.first_fill_wins,
+            allow_existing_positions=args.continue_open_independent_positions,
             max_unaccepted_quote_age_seconds=args.max_unaccepted_quote_age,
             max_fair_age_seconds=args.max_fair_age,
             reconcile_seconds=args.reconcile_seconds,
@@ -1243,7 +1362,35 @@ def _cmd_rfq_maker(args: argparse.Namespace) -> None:
             max_quote_latency_seconds=args.max_quote_latency,
             combo_only=args.combo_only,
             contracts_only=args.contracts_only,
+            coverage_shadow=args.coverage_shadow,
             require_subaccount_metadata=args.execute_live,
+            pricing_mode=(
+                "lead_fixed"
+                if args.lead_style_profile and not args.proportional_pricing
+                else "proportional"
+            ),
+            no_side_only=args.lead_style_profile or args.no_side_only,
+            pinnacle_only=args.lead_style_profile or args.pinnacle_only,
+            max_hours_to_start=(
+                Decimal("12") if args.lead_style_profile else args.max_hours_to_start
+            ),
+            moneyline_yes_only=args.lead_style_profile or args.moneyline_yes_only,
+            max_moneyline_fair=(
+                Decimal("5") / Decimal("7")
+                if args.lead_style_profile
+                else args.max_moneyline_fair
+            ),
+            fixed_margin=args.fixed_margin_cents / Decimal("100"),
+            minimum_cushion=args.minimum_cushion_cents / Decimal("100"),
+            two_leg_premium=args.two_leg_premium_cents / Decimal("100"),
+            player_prop_premium=args.player_prop_premium_cents / Decimal("100"),
+            soccer_premium=args.soccer_premium_cents / Decimal("100"),
+            per_leg_outcome_notional_cap=args.per_leg_outcome_cap,
+            per_combo_notional_cap=args.per_combo_cap,
+            creator_rate_limit=args.lead_style_profile or args.creator_rate_limit,
+            creator_burst_limit=args.creator_burst_limit,
+            creator_burst_window_seconds=args.creator_burst_window,
+            required_active_sports=tuple(args.require_active_sport),
         ),
         audit_log=_RFQAudit(args.audit_log, json_output=args.json),
         execute=execute,
@@ -1251,20 +1398,21 @@ def _cmd_rfq_maker(args: argparse.Namespace) -> None:
         allowed_tickers=set(args.allow_ticker or ()),
         allowed_collections=set(args.allow_collection or ()),
     )
-    mode = (
-        "production execution"
-        if args.execute_live
-        else "demo execution"
-        if execute
-        else "dry run"
-    )
+    if args.execute_live:
+        mode = "production execution"
+    elif execute:
+        mode = "demo execution"
+    elif args.coverage_shadow:
+        mode = "coverage shadow"
+    else:
+        mode = "dry run"
     if not args.json:
-        print(
-            f"Starting moneyline RFQ maker ({mode}); minimum edge "
-            f"{args.edge_percent}% of fair value net of modeled maker fees. "
-            f"Audit: {args.audit_log}",
-            flush=True,
+        pricing = (
+            f"fixed {args.fixed_margin_cents}¢ base margin plus configured premiums"
+            if args.lead_style_profile
+            else f"minimum edge {args.edge_percent}% of fair value net of modeled fees"
         )
+        print(f"Starting RFQ maker ({mode}); {pricing}. Audit: {args.audit_log}", flush=True)
     asyncio.run(maker.run(seconds=args.seconds, max_messages=args.messages))
 
 
@@ -1571,13 +1719,26 @@ def build_parser() -> argparse.ArgumentParser:
 
     rfq = subparsers.add_parser(
         "rfq-maker",
-        help="quote two-way moneyline RFQs from a fresh external fair value",
+        help="quote supported RFQs from fresh external fair values",
     )
     fair = rfq.add_argument_group("fair-value cache")
     fair.add_argument("--fair-file", type=Path)
     fair.add_argument("--fair-file-refresh", type=float, default=0.25)
     fair.add_argument("--series", help="Kalshi moneyline series, used with --odds-sport")
     fair.add_argument("--odds-sport", help="Odds API sport key, e.g. baseball_mlb")
+    fair.add_argument(
+        "--odds-lane",
+        action="append",
+        type=_odds_lane,
+        default=[],
+        metavar="SERIES:SPORT:MARKET",
+        help="repeatable direct-odds lane for cross-sport RFQs",
+    )
+    fair.add_argument(
+        "--odds-market-type",
+        choices=("h2h", "totals", "spreads"),
+        default="h2h",
+    )
     fair.add_argument("--odds-regions", default="us")
     fair.add_argument("--odds-bookmakers", default=DEFAULT_SHARP_BOOKMAKERS)
     fair.add_argument("--odds-min-bookmakers", type=int, default=2)
@@ -1587,7 +1748,48 @@ def build_parser() -> argparse.ArgumentParser:
     pricing = rfq.add_argument_group("pricing and risk")
     pricing.add_argument("--allow-ticker", action="append", default=[])
     pricing.add_argument("--allow-collection", action="append", default=[])
-    pricing.add_argument("--edge-percent", type=_decimal, default=Decimal("2"))
+    pricing.add_argument("--edge-percent", type=_decimal, default=Decimal("1.1"))
+    pricing.add_argument(
+        "--lead-style-profile",
+        action="store_true",
+        help="enable Pinnacle-only NO-side fixed-margin pricing and lead-style filters",
+    )
+    pricing.add_argument(
+        "--proportional-pricing",
+        action="store_true",
+        help=(
+            "use --edge-percent proportional pricing; with --lead-style-profile, retain "
+            "the lead-style filters while overriding its fixed-cent pricing"
+        ),
+    )
+    pricing.add_argument("--no-side-only", action="store_true")
+    pricing.add_argument("--pinnacle-only", action="store_true")
+    pricing.add_argument("--moneyline-yes-only", action="store_true")
+    pricing.add_argument("--max-hours-to-start", type=_decimal)
+    pricing.add_argument("--max-moneyline-fair", type=_decimal)
+    pricing.add_argument("--fixed-margin-cents", type=_decimal, default=Decimal("0.6"))
+    pricing.add_argument(
+        "--minimum-cushion-cents", type=_decimal, default=Decimal("0.7")
+    )
+    pricing.add_argument(
+        "--two-leg-premium-cents", type=_decimal, default=Decimal("0.9")
+    )
+    pricing.add_argument(
+        "--player-prop-premium-cents", type=_decimal, default=Decimal("0.5")
+    )
+    pricing.add_argument("--soccer-premium-cents", type=_decimal, default=Decimal("0.5"))
+    pricing.add_argument("--per-leg-outcome-cap", type=_decimal)
+    pricing.add_argument("--per-combo-cap", type=_decimal)
+    pricing.add_argument("--creator-rate-limit", action="store_true")
+    pricing.add_argument("--creator-burst-limit", type=int, default=2)
+    pricing.add_argument("--creator-burst-window", type=float, default=10)
+    pricing.add_argument(
+        "--require-active-sport",
+        action="append",
+        default=[],
+        choices=("mlb", "wnba", "mls", "liga_mx"),
+        help="fail startup unless this sport has a priceable fixture inside the time horizon",
+    )
     pricing.add_argument(
         "--maker-fee-rate-percent",
         type=_decimal,
@@ -1596,15 +1798,37 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pricing.add_argument("--min-contracts", type=_decimal, default=Decimal("1"))
     pricing.add_argument("--max-contracts", type=_decimal, default=Decimal("10"))
+    pricing.add_argument(
+        "--max-target-cost",
+        type=_decimal,
+        help="maximum requester target_cost_dollars accepted by the local risk profile",
+    )
     pricing.add_argument("--min-legs", type=int, default=2)
     pricing.add_argument("--max-legs", type=int, default=10)
     pricing.add_argument("--max-inflight-rfqs", type=int, default=32)
     pricing.add_argument("--max-quote-latency", type=float, default=1.0)
     pricing.add_argument("--max-position", type=_decimal, default=Decimal("10"))
     pricing.add_argument("--max-notional", type=_decimal, default=Decimal("10"))
+    pricing.add_argument("--max-session-notional", type=_decimal)
     pricing.add_argument("--max-session-contracts", type=_decimal)
     pricing.add_argument("--max-session-executions", type=int)
     pricing.add_argument("--max-active-quotes", type=int, default=20)
+    pricing.add_argument(
+        "--first-fill-wins",
+        action="store_true",
+        help=(
+            "share one risk envelope across outstanding quotes; requires exactly one "
+            "session execution and atomically confirms only the first acceptance"
+        ),
+    )
+    pricing.add_argument(
+        "--continue-open-independent-positions",
+        action="store_true",
+        help=(
+            "allow a guarded continuation only after reconstructing every existing "
+            "combo's games and participants and rejecting all overlap"
+        ),
+    )
     pricing.add_argument(
         "--max-unaccepted-quote-age",
         type=float,
@@ -1618,10 +1842,21 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="reject single-market RFQs and quote only allowed MVE collections",
     )
-    pricing.add_argument(
+    sizing = pricing.add_mutually_exclusive_group()
+    sizing.add_argument(
         "--contracts-only",
         action="store_true",
         help="reject target-cost RFQs and quote only explicit contract-count requests",
+    )
+    sizing.add_argument(
+        "--allow-target-cost",
+        action="store_true",
+        help="explicitly enable target-cost RFQs; required for the live target-cost canary",
+    )
+    pricing.add_argument(
+        "--coverage-shadow",
+        action="store_true",
+        help="measure quoteable contract and target-cost RFQs without submitting quotes",
     )
     pricing.add_argument(
         "--allow-live",

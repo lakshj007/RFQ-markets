@@ -2,7 +2,13 @@ from decimal import Decimal
 
 import pytest
 
-from kalshi_mm.cli import _preflight_rfq_live_canary, _validate_rfq_live_canary, build_parser
+from kalshi_mm.cli import (
+    _odds_lane,
+    _preflight_rfq_live_canary,
+    _rfq_client,
+    _validate_rfq_live_canary,
+    build_parser,
+)
 
 
 class CanaryClient:
@@ -38,6 +44,26 @@ class CanaryClient:
         return []
 
 
+def test_odds_lane_parses_explicit_series_sport_and_market() -> None:
+    assert _odds_lane("KXMLBTOTAL:baseball_mlb:totals") == (
+        "KXMLBTOTAL",
+        "baseball_mlb",
+        "totals",
+    )
+
+
+def test_odds_lane_rejects_unknown_market_type() -> None:
+    with pytest.raises(Exception, match="h2h, totals, or spreads"):
+        _odds_lane("KXMLBHR:baseball_mlb:player_props")
+
+
+def test_rfq_defaults_to_one_point_one_percent_proportional_edge() -> None:
+    args = build_parser().parse_args(["rfq-maker", "--fair-file", "fairs.json"])
+
+    assert args.edge_percent == Decimal("1.1")
+    assert args.proportional_pricing is False
+
+
 def canary_args():
     return build_parser().parse_args(
         [
@@ -51,17 +77,19 @@ def canary_args():
             "--combo-only",
             "--contracts-only",
             "--edge-percent",
-            "1",
+            "0.75",
             "--max-contracts",
             "10",
             "--max-position",
             "10",
             "--max-notional",
-            "10",
+            "5",
+            "--max-session-notional",
+            "20",
             "--max-session-contracts",
-            "10",
+            "40",
             "--max-session-executions",
-            "1",
+            "4",
             "--max-active-quotes",
             "1",
             "--max-unaccepted-quote-age",
@@ -84,14 +112,44 @@ def test_locked_rfq_live_canary_profile_is_accepted() -> None:
 
     _validate_rfq_live_canary(args)
 
-    assert args.edge_percent == Decimal("1")
+    assert args.edge_percent == Decimal("0.75")
 
 
-def test_rfq_live_canary_rejects_edge_below_one_percent() -> None:
+def test_live_canary_accepts_guarded_wnba_and_soccer_lanes() -> None:
     args = canary_args()
-    args.edge_percent = Decimal("0.999")
+    args.series = None
+    args.odds_sport = None
+    args.lead_style_profile = True
+    args.odds_lane = [
+        ("KXMLBGAME", "baseball_mlb", "h2h"),
+        ("KXWNBAGAME", "basketball_wnba", "h2h"),
+        ("KXWNBATOTAL", "basketball_wnba", "totals"),
+        ("KXWNBASPREAD", "basketball_wnba", "spreads"),
+        ("KXMLSGAME", "soccer_usa_mls", "h2h"),
+        ("KXMLSTOTAL", "soccer_usa_mls", "totals"),
+        ("KXLIGAMXGAME", "soccer_mexico_ligamx", "h2h"),
+        ("KXLIGAMXTOTAL", "soccer_mexico_ligamx", "totals"),
+    ]
 
-    with pytest.raises(ValueError, match="at least 1%"):
+    _validate_rfq_live_canary(args)
+
+
+def test_live_canary_rejects_unapproved_multi_lane() -> None:
+    args = canary_args()
+    args.series = None
+    args.odds_sport = None
+    args.lead_style_profile = True
+    args.odds_lane = [("KXUFCFIGHT", "mma_mixed_martial_arts", "h2h")]
+
+    with pytest.raises(ValueError, match="unsupported odds lane"):
+        _validate_rfq_live_canary(args)
+
+
+def test_rfq_live_canary_rejects_edge_below_three_quarter_percent() -> None:
+    args = canary_args()
+    args.edge_percent = Decimal("0.749")
+
+    with pytest.raises(ValueError, match="at least 0.75%"):
         _validate_rfq_live_canary(args)
 
 
@@ -103,6 +161,14 @@ def test_rfq_live_canary_requires_sixty_second_unaccepted_quote_lifetime() -> No
         _validate_rfq_live_canary(args)
 
 
+def test_rfq_live_canary_requires_aggregate_ten_dollar_notional_cap() -> None:
+    args = canary_args()
+    args.max_session_notional = None
+
+    with pytest.raises(ValueError, match="session-wide notional cap"):
+        _validate_rfq_live_canary(args)
+
+
 def test_rfq_live_canary_rejects_primary_account() -> None:
     args = canary_args()
     args.subaccount = 0
@@ -111,11 +177,95 @@ def test_rfq_live_canary_rejects_primary_account() -> None:
         _validate_rfq_live_canary(args)
 
 
-def test_rfq_live_canary_rejects_target_cost_support() -> None:
+def test_rfq_live_canary_accepts_explicit_target_cost_support() -> None:
+    args = canary_args()
+    args.contracts_only = False
+    args.allow_target_cost = True
+    args.max_target_cost = Decimal("5")
+
+    _validate_rfq_live_canary(args)
+
+
+def test_rfq_live_canary_target_cost_requires_explicit_cap() -> None:
+    args = canary_args()
+    args.contracts_only = False
+    args.allow_target_cost = True
+
+    with pytest.raises(ValueError, match="max-target-cost in"):
+        _validate_rfq_live_canary(args)
+
+
+def test_explicit_target_cost_mode_always_requires_a_dollar_cap() -> None:
+    args = canary_args()
+    args.contracts_only = False
+    args.allow_target_cost = True
+
+    with pytest.raises(ValueError, match="allow-target-cost requires"):
+        _rfq_client(args)
+
+
+def test_coverage_shadow_requires_a_simulated_quote_lifetime() -> None:
+    args = canary_args()
+    args.contracts_only = False
+    args.allow_target_cost = True
+    args.max_target_cost = Decimal("10")
+    args.coverage_shadow = True
+    args.max_unaccepted_quote_age = None
+
+    with pytest.raises(ValueError, match="max-unaccepted-quote-age"):
+        _rfq_client(args)
+
+
+def test_rfq_live_canary_contract_mode_rejects_target_cost_cap() -> None:
+    args = canary_args()
+    args.max_target_cost = Decimal("10")
+
+    with pytest.raises(ValueError, match="contracts-only live canary"):
+        _validate_rfq_live_canary(args)
+
+
+def test_rfq_live_canary_requires_explicit_sizing_mode() -> None:
     args = canary_args()
     args.contracts_only = False
 
-    with pytest.raises(ValueError, match="requires --contracts-only"):
+    with pytest.raises(ValueError, match="explicit sizing mode"):
+        _validate_rfq_live_canary(args)
+
+
+def test_rfq_live_canary_allows_four_disjoint_quote_slots() -> None:
+    args = canary_args()
+    args.max_active_quotes = 4
+    args.max_inflight_rfqs = 4
+
+    _validate_rfq_live_canary(args)
+
+
+def test_rfq_live_canary_rejects_more_than_four_quote_slots() -> None:
+    args = canary_args()
+    args.max_active_quotes = 5
+
+    with pytest.raises(ValueError, match="first-fill-wins"):
+        _validate_rfq_live_canary(args)
+
+
+def test_rfq_live_canary_rejects_first_fill_wins_for_four_fill_run() -> None:
+    args = canary_args()
+    args.first_fill_wins = True
+    args.max_active_quotes = 20
+    args.max_inflight_rfqs = 20
+
+    with pytest.raises(ValueError, match="four-fill"):
+        _validate_rfq_live_canary(args)
+
+
+def test_rfq_live_canary_allows_up_to_ten_independent_legs() -> None:
+    args = canary_args()
+    args.max_legs = 10
+
+    _validate_rfq_live_canary(args)
+
+    args.max_legs = 11
+    with pytest.raises(ValueError, match="2-10 independent"):
         _validate_rfq_live_canary(args)
 
 
@@ -145,6 +295,34 @@ def test_rfq_live_canary_primary_preflight_allows_balance_above_one_dollar(tmp_p
     client = CanaryClient(key, subaccount=0, balance="1000")
 
     _preflight_rfq_live_canary(client, args)
+
+
+def test_rfq_live_canary_requires_explicit_open_position_continuation(tmp_path) -> None:
+    class PositionedCanaryClient(CanaryClient):
+        def get_positions(self, *, subaccount: int, limit: int):
+            return [{"ticker": "COMBO", "position_fp": "-1.00"}]
+
+    key = tmp_path / "rfq.key"
+    key.write_text("test", encoding="utf-8")
+    key.chmod(0o600)
+    args = canary_args()
+    client = PositionedCanaryClient(key, subaccount=1, balance="649")
+
+    with pytest.raises(ValueError, match="already has positions"):
+        _preflight_rfq_live_canary(client, args)
+
+    args.continue_open_independent_positions = True
+    _preflight_rfq_live_canary(client, args)
+
+
+def test_rfq_live_canary_allows_smaller_cash_and_target_cost_caps() -> None:
+    args = canary_args()
+    args.contracts_only = False
+    args.allow_target_cost = True
+    args.max_target_cost = Decimal("5")
+    args.max_session_notional = Decimal("5")
+
+    _validate_rfq_live_canary(args)
 
 
 def test_rfq_live_canary_numbered_preflight_keeps_ten_dollar_balance_cap(tmp_path) -> None:

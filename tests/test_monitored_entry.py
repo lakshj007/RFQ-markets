@@ -250,9 +250,9 @@ def test_valid_fair_rests_unchanged_until_bounded_timeout(monkeypatch, tmp_path)
     assert client.created[0]["expiration_time"] == int(NOW.timestamp()) + 10
 
 
-def test_fair_below_two_cent_threshold_cancels(monkeypatch, tmp_path) -> None:
+def test_fair_below_live_edge_threshold_cancels(monkeypatch, tmp_path) -> None:
     client = MonitoredClient()
-    result, _ = run_monitor(monkeypatch, tmp_path, client, ScriptedFair(snapshot("0.6199")))
+    result, _ = run_monitor(monkeypatch, tmp_path, client, ScriptedFair(snapshot("0.6099")))
 
     assert result["cancellation_reason"] == "fair_below_threshold"
     assert client.cancelled == ["order-1"]

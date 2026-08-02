@@ -133,21 +133,16 @@ class PriceGrid:
             raise ValueError("market price range step must be positive")
         return cls(tuple(sorted(ranges, key=lambda item: item.start)))
 
-    def _range_for(self, price: Decimal) -> PriceRange:
-        bounded = min(max(price, self.ranges[0].start), self.ranges[-1].end)
-        for item in self.ranges:
-            if item.contains(bounded):
-                return item
-        return min(self.ranges, key=lambda item: abs(item.start - bounded))
-
     def floor(self, price: Decimal) -> Decimal:
-        item = self._range_for(price)
+        eligible = [item for item in self.ranges if item.start <= price]
+        item = max(eligible, key=lambda candidate: candidate.start) if eligible else self.ranges[0]
         bounded = min(max(price, item.start), item.end)
         ticks = ((bounded - item.start) / item.step).to_integral_value(rounding=ROUND_FLOOR)
         return item.start + ticks * item.step
 
     def ceil(self, price: Decimal) -> Decimal:
-        item = self._range_for(price)
+        eligible = [item for item in self.ranges if item.end >= price]
+        item = min(eligible, key=lambda candidate: candidate.end) if eligible else self.ranges[-1]
         bounded = min(max(price, item.start), item.end)
         ticks = ((bounded - item.start) / item.step).to_integral_value(rounding=ROUND_CEILING)
         return item.start + ticks * item.step
@@ -179,4 +174,3 @@ class QuotePlan:
     book_imbalance: Decimal
     trade_imbalance: Decimal
     notes: tuple[str, ...] = ()
-
