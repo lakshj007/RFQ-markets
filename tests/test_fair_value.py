@@ -3,7 +3,10 @@ from decimal import Decimal
 
 import pytest
 
-from kalshi_mm.fair_value import JsonFileFairValue, StaticFairValue
+from kalshi_mm.fair_value import JsonFileFairValue, OddsConsensusFairValue, StaticFairValue
+from kalshi_mm.odds import DEFAULT_SHARP_BOOKMAKERS
+from tests.test_matching import kalshi_event
+from tests.test_scanner import _two_book_event
 
 
 def test_json_fair_value_reloads_file(tmp_path) -> None:
@@ -20,3 +23,65 @@ def test_fair_value_must_be_probability() -> None:
     with pytest.raises(ValueError, match="between 0 and 1"):
         StaticFairValue(Decimal("1.1")).get("MARKET")
 
+
+class FairFakeKalshi:
+    def get_market(self, ticker: str) -> dict:
+        return {
+            "ticker": ticker,
+            "event_ticker": "KXMLBGAME-TEST",
+            "yes_sub_title": "Toronto",
+        }
+
+    def get_event(self, event_ticker: str) -> dict:
+        assert event_ticker == "KXMLBGAME-TEST"
+        return kalshi_event()
+
+
+class FairFakeOdds:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.event_calls = 0
+        self.bookmakers: str | None = None
+
+    def get_odds(self, *args, **kwargs) -> list:
+        self.calls += 1
+        self.bookmakers = kwargs["bookmakers"]
+        return [_two_book_event()]
+
+    def get_event_odds(self, sport, event_id, **kwargs):
+        self.event_calls += 1
+        assert event_id == _two_book_event().event_id
+        return _two_book_event()
+
+
+def test_odds_consensus_fair_value_is_cached_between_book_updates() -> None:
+    odds = FairFakeOdds()
+    source = OddsConsensusFairValue(
+        kalshi=FairFakeKalshi(),  # type: ignore[arg-type]
+        odds=odds,  # type: ignore[arg-type]
+        market_ticker="MARKET",
+        sport="baseball_mlb",
+        max_age_seconds=10**9,
+        refresh_seconds=60,
+        include_live=True,
+    )
+
+    first = source.get("MARKET")
+    second = source.get("MARKET")
+    snapshot = source.snapshot("MARKET")
+
+    assert Decimal("0.5") < first < Decimal("0.55")
+    assert second == first
+    assert snapshot.probability == first
+    assert snapshot.event_commence_time == _two_book_event().commence_time
+    assert snapshot.observed_at.tzinfo is not None
+    assert odds.calls == 1
+    assert odds.event_calls == 0
+    assert odds.bookmakers == DEFAULT_SHARP_BOOKMAKERS
+
+    refreshed = source.refresh_snapshot("MARKET")
+
+    assert refreshed.event_id == _two_book_event().event_id
+    assert refreshed.bookmaker_count == 2
+    assert odds.calls == 1
+    assert odds.event_calls == 1

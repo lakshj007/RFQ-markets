@@ -9,8 +9,10 @@ description = "Dry-run-first reference market maker for Kalshi sports markets"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "certifi>=2024.12.14",
   "cryptography>=44",
   "requests>=2.32",
+  "websockets>=15",
 ]
 
 [project.optional-dependencies]
@@ -35,4 +37,3 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
-

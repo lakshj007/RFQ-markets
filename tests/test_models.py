@@ -2,7 +2,7 @@ from decimal import Decimal
 
 import pytest
 
-from kalshi_mm.models import OrderBook, PriceGrid
+from kalshi_mm.models import OrderBook, PriceGrid, PriceRange
 
 
 def test_orderbook_converts_no_bids_to_yes_asks() -> None:
@@ -44,3 +44,14 @@ def test_price_grid_uses_market_price_ranges() -> None:
     assert grid.floor(Decimal("0.567")) == Decimal("0.5600")
     assert grid.ceil(Decimal("0.567")) == Decimal("0.5700")
 
+
+def test_price_grid_rounds_in_the_requested_direction_across_a_range_gap() -> None:
+    grid = PriceGrid(
+        (
+            PriceRange(Decimal("0"), Decimal("0.50"), Decimal("0.01")),
+            PriceRange(Decimal("0.52"), Decimal("1"), Decimal("0.01")),
+        )
+    )
+
+    assert grid.floor(Decimal("0.51")) == Decimal("0.50")
+    assert grid.ceil(Decimal("0.51")) == Decimal("0.52")
